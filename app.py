@@ -217,6 +217,11 @@ def get_client():
 
 sb = get_client()
 
+# URL publica de la app (necesaria para armar el link de recuperacion de
+# contraseña que Supabase manda por correo -- debe coincidir con una de
+# las "Redirect URLs" configuradas en Supabase, ver fase5_login/LEEME.txt).
+APP_URL = "https://presupuesto-udgpw8evderlmem9wxitkd.streamlit.app/"
+
 
 # ---------------------------------------------------------------------
 # Login (Fase 5)
@@ -259,6 +264,29 @@ def pantalla_login():
             email = st.text_input("Correo")
             password = st.text_input("Contraseña", type="password")
             enviado = st.form_submit_button("Entrar", type="primary")
+
+        with st.expander("¿Olvidaste tu contraseña?"):
+            email_recuperar = st.text_input(
+                "Escribe el correo con el que entras a la app", key="email_recuperar"
+            )
+            if st.button("Enviar link de recuperacion"):
+                if not email_recuperar:
+                    st.error("Escribe tu correo.")
+                else:
+                    try:
+                        sb.auth.reset_password_for_email(
+                            email_recuperar, {"redirect_to": APP_URL}
+                        )
+                    except Exception:
+                        pass
+                    # Mensaje generico a proposito (no confirma ni niega si el
+                    # correo existe -- evita que alguien use este formulario
+                    # para averiguar que correos estan registrados).
+                    st.success(
+                        "Si ese correo esta registrado, te llega un link para "
+                        "poner una contraseña nueva (revisa tambien spam). "
+                        "El link vale por un tiempo limitado."
+                    )
     if enviado:
         if not email or not password:
             st.error("Escribe correo y contraseña.")
@@ -297,6 +325,69 @@ def pantalla_login():
                     st.rerun()
     st.stop()
 
+
+def _limpiar_query_params():
+    for clave in list(st.query_params.keys()):
+        del st.query_params[clave]
+
+
+def pantalla_restablecer_password(token_hash):
+    _, col_form, _ = st.columns([1, 1.1, 1])
+    with col_form:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=220)
+        st.markdown(
+            '<h2 style="text-align:center;margin-top:0">Poner una contraseña nueva</h2>',
+            unsafe_allow_html=True,
+        )
+
+        if "recovery_verificado" not in st.session_state:
+            try:
+                sb.auth.verify_otp({"token_hash": token_hash, "type": "recovery"})
+                st.session_state.recovery_verificado = True
+            except Exception:
+                st.error(
+                    "Este link ya no es valido (puede que haya expirado o que ya "
+                    "se haya usado). Vuelve a la pantalla de inicio y pide uno nuevo "
+                    "desde '¿Olvidaste tu contraseña?'."
+                )
+                if st.button("Ir a iniciar sesion"):
+                    _limpiar_query_params()
+                    st.rerun()
+                st.stop()
+
+        with st.form("form_nueva_password"):
+            nueva = st.text_input("Contraseña nueva", type="password")
+            confirmar = st.text_input("Confirma la contraseña nueva", type="password")
+            enviado = st.form_submit_button("Guardar contraseña nueva", type="primary")
+
+    if enviado:
+        if not nueva or len(nueva) < 6:
+            st.error("La contraseña debe tener al menos 6 caracteres.")
+        elif nueva != confirmar:
+            st.error("Las dos contraseñas no coinciden.")
+        else:
+            try:
+                sb.auth.update_user({"password": nueva})
+            except Exception as e:
+                st.error(f"No se pudo guardar la contraseña nueva: {e}")
+            else:
+                st.session_state.pop("recovery_verificado", None)
+                try:
+                    sb.auth.sign_out()
+                except Exception:
+                    pass
+                _limpiar_query_params()
+                st.success("Contraseña actualizada. Ya puedes iniciar sesion con ella.")
+                if st.button("Ir a iniciar sesion"):
+                    st.rerun()
+                st.stop()
+    st.stop()
+
+
+_qp = st.query_params
+if _qp.get("type") == "recovery" and _qp.get("token_hash") and not usuario_actual():
+    pantalla_restablecer_password(_qp.get("token_hash"))
 
 if not usuario_actual():
     pantalla_login()
