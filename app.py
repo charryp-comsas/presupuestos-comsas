@@ -2688,7 +2688,7 @@ st.markdown(
     '<h1 style="margin-bottom:0">Presupuestos <span style="color:#9C7A2E">COMSAS</span></h1>',
     unsafe_allow_html=True,
 )
-st.caption("Prototipo Fase 1 + 2 + 3 + 4 - conectado a la base de datos real (catalogo_apu, cuadrillas, etc.)")
+st.caption("Fase 1 + 2 + 3 + 4 + 5 - conectado a la base de datos real (catalogo_apu, cuadrillas, etc.)")
 
 tab_nuevo, tab_catalogo, tab_resumen, tab_aiu, tab_precios, tab_editor_apu = st.tabs(
     [
