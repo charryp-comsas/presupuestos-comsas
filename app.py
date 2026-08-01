@@ -116,10 +116,11 @@ st.markdown(
     }}
 
     /* Barra de pestañas: cajas reales con color, no solo texto subrayado.
-    Selectores duplicados a proposito (data-baseweb Y role/data-testid) --
-    Streamlit ha cambiado el HTML interno de las pestañas entre versiones,
-    y en la nube corre una version distinta a la que se probo esto la
-    primera vez, asi que se cubren ambas formas. */
+    Confirmado por inspeccion en la app publicada (2026-08-01): cada pestaña
+    es un <div data-testid="stTab" aria-selected="..."> -- NO un
+    <button data-baseweb="tab"> como en versiones viejas de Streamlit. Se
+    dejan ambos selectores por compatibilidad, pero el que realmente
+    aplica ahora es data-testid="stTab". */
     .stTabs [data-baseweb="tab-list"],
     div[data-testid="stTabs"] [role="tablist"] {{
         gap: 6px;
@@ -128,7 +129,7 @@ st.markdown(
         padding-left: 2px;
     }}
     .stTabs [data-baseweb="tab"],
-    div[data-testid="stTabs"] button[role="tab"] {{
+    div[data-testid="stTab"] {{
         background-color: #F5F1E8 !important;
         border: 1px solid rgba(198, 161, 91, 0.4) !important;
         border-bottom: none !important;
@@ -139,12 +140,12 @@ st.markdown(
         transition: background-color 0.15s ease, color 0.15s ease;
     }}
     .stTabs [data-baseweb="tab"]:hover,
-    div[data-testid="stTabs"] button[role="tab"]:hover {{
+    div[data-testid="stTab"]:hover {{
         background-color: #EFE3C4 !important;
         color: #161412 !important;
     }}
     .stTabs [aria-selected="true"],
-    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
+    div[data-testid="stTab"][aria-selected="true"] {{
         background-color: #161412 !important;
         border-color: #161412 !important;
         color: var(--comsas-gold) !important;
@@ -152,8 +153,8 @@ st.markdown(
     }}
     .stTabs [aria-selected="true"] p,
     .stTabs [aria-selected="true"] *,
-    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p,
-    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] * {{
+    div[data-testid="stTab"][aria-selected="true"] p,
+    div[data-testid="stTab"][aria-selected="true"] * {{
         color: var(--comsas-gold) !important;
     }}
     /* la barra deslizante de subrayado ya no hace falta con pestañas en caja */
