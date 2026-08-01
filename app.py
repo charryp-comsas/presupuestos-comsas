@@ -129,10 +129,10 @@ st.markdown(
     }}
     .stTabs [data-baseweb="tab"],
     div[data-testid="stTabs"] button[role="tab"] {{
-        background-color: #F5F1E8;
-        border: 1px solid rgba(198, 161, 91, 0.4);
-        border-bottom: none;
-        border-radius: 10px 10px 0 0;
+        background-color: #F5F1E8 !important;
+        border: 1px solid rgba(198, 161, 91, 0.4) !important;
+        border-bottom: none !important;
+        border-radius: 10px 10px 0 0 !important;
         padding: 10px 22px;
         color: #4a4740 !important;
         font-weight: 500;
@@ -140,7 +140,7 @@ st.markdown(
     }}
     .stTabs [data-baseweb="tab"]:hover,
     div[data-testid="stTabs"] button[role="tab"]:hover {{
-        background-color: #EFE3C4;
+        background-color: #EFE3C4 !important;
         color: #161412 !important;
     }}
     .stTabs [aria-selected="true"],
