@@ -250,6 +250,15 @@ def es_admin():
     return bool(u) and u.get("rol") == "administrador"
 
 
+def _usuario_bitacora():
+    """Correo del usuario conectado, para dejar registrado en la bitacora
+    de cambios de precios/APU quien hizo cada modificacion. 'sistema' es
+    un respaldo por si algo llama esto sin sesion activa (no deberia
+    pasar, la app exige login antes de llegar a estas pantallas)."""
+    u = usuario_actual()
+    return (u or {}).get("email") or "sistema"
+
+
 def cerrar_sesion():
     try:
         sb.auth.sign_out()
@@ -1962,6 +1971,7 @@ def recalcular_materiales_apus_afectados(sb, insumo_codigos, origen, usuario_not
                 "valor_anterior": viejo,
                 "valor_nuevo": nuevo,
                 "origen": origen,
+                "usuario": _usuario_bitacora(),
             }
         ).execute()
         aplicados += 1
@@ -2005,6 +2015,7 @@ def aplicar_escalamiento_icoced(sb, insumos_candidatos, pct):
                 "valor_anterior": viejo,
                 "valor_nuevo": nuevo,
                 "origen": "ICOCED",
+                "usuario": _usuario_bitacora(),
             }
         ).execute()
         aplicados += 1
@@ -2238,6 +2249,7 @@ def aplicar_precios_desde_facturas(sb, propuestas):
                 "valor_anterior": p["precio_actual"],
                 "valor_nuevo": p["precio_factura"],
                 "origen": "FACTURA",
+                "usuario": _usuario_bitacora(),
             }
         ).execute()
         aplicados += 1
@@ -2446,6 +2458,7 @@ def aplicar_recosteo_mano_obra(sb, impacto):
                 "valor_anterior": fila["mano_obra_viejo"],
                 "valor_nuevo": fila["mano_obra_nuevo"],
                 "origen": "MANUAL",
+                "usuario": _usuario_bitacora(),
             }
         ).execute()
         aplicados += 1
@@ -2587,6 +2600,16 @@ def crear_insumo_nuevo(sb, codigo, descripcion, unidad, precio, proveedor=None, 
         registro["origen_precio"] = "COTIZADO"
         registro["fecha_cotizacion"] = date.today().isoformat()
     sb.table("insumos").insert(registro).execute()
+    sb.table("bitacora_precios").insert(
+        {
+            "insumo_codigo": codigo,
+            "campo": "creacion",
+            "valor_anterior": 0,
+            "valor_nuevo": float(precio or 0),
+            "origen": "CREACION",
+            "usuario": _usuario_bitacora(),
+        }
+    ).execute()
     return codigo
 
 
@@ -2600,6 +2623,16 @@ def crear_apu_nuevo(sb, codigo, descripcion, unidad):
         raise ValueError(f"Ya existe un APU con el codigo {codigo}.")
     sb.table("catalogo_apu").insert(
         {"codigo": codigo, "descripcion": descripcion.strip(), "unidad": unidad.strip(), "es_candidato": True}
+    ).execute()
+    sb.table("bitacora_precios").insert(
+        {
+            "apu_codigo": codigo,
+            "campo": "creacion",
+            "valor_anterior": 0,
+            "valor_nuevo": 0,
+            "origen": "CREACION",
+            "usuario": _usuario_bitacora(),
+        }
     ).execute()
     return codigo
 
@@ -2618,6 +2651,7 @@ def _registrar_cambio_apu(sb, apu_codigo, campo, viejo, nuevo, origen="MANUAL"):
             "valor_anterior": float(viejo),
             "valor_nuevo": float(nuevo),
             "origen": origen,
+            "usuario": _usuario_bitacora(),
         }
     ).execute()
 
@@ -4078,7 +4112,7 @@ with tab_precios:
     # --- Bitacora ---
     with sub_bitacora:
         st.subheader("Bitacora de cambios de precios")
-        st.caption("Auditoria: quien (via origen) cambio que precio, y cuando.")
+        st.caption("Auditoria: quien cambio que precio (usuario y origen), y cuando.")
         import pandas as pd
 
         registros = obtener_bitacora(sb)
@@ -4086,7 +4120,10 @@ with tab_precios:
             st.info("Todavia no hay cambios registrados en la bitacora.")
         else:
             df_bit = pd.DataFrame(registros)
-            col_f1, col_f2 = st.columns(2)
+            if "usuario" not in df_bit.columns:
+                df_bit["usuario"] = None
+            df_bit["usuario"] = df_bit["usuario"].fillna("(sin registrar)")
+            col_f1, col_f2, col_f3 = st.columns(3)
             with col_f1:
                 filtro_campo = st.multiselect(
                     "Campo", sorted(df_bit["campo"].unique()), default=list(df_bit["campo"].unique())
@@ -4096,10 +4133,19 @@ with tab_precios:
                     "Origen", sorted(df_bit["origen"].dropna().unique()),
                     default=list(df_bit["origen"].dropna().unique()),
                 )
+            with col_f3:
+                filtro_usuario = st.multiselect(
+                    "Usuario", sorted(df_bit["usuario"].unique()), default=list(df_bit["usuario"].unique())
+                )
             df_bit_filtrado = df_bit[
-                df_bit["campo"].isin(filtro_campo) & df_bit["origen"].isin(filtro_origen)
+                df_bit["campo"].isin(filtro_campo)
+                & df_bit["origen"].isin(filtro_origen)
+                & df_bit["usuario"].isin(filtro_usuario)
             ]
-            columnas_bit = ["creado_en", "apu_codigo", "insumo_codigo", "campo", "valor_anterior", "valor_nuevo", "origen"]
+            columnas_bit = [
+                "creado_en", "usuario", "apu_codigo", "insumo_codigo",
+                "campo", "valor_anterior", "valor_nuevo", "origen",
+            ]
             columnas_bit = [c for c in columnas_bit if c in df_bit_filtrado.columns]
             st.dataframe(
                 df_bit_filtrado[columnas_bit],
