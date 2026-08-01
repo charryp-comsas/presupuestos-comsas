@@ -115,44 +115,58 @@ st.markdown(
         margin-bottom: 8px;
     }}
 
-    /* Barra de pestañas: cajas reales con color, no solo texto subrayado */
-    .stTabs [data-baseweb="tab-list"] {{
+    /* Barra de pestañas: cajas reales con color, no solo texto subrayado.
+    Selectores duplicados a proposito (data-baseweb Y role/data-testid) --
+    Streamlit ha cambiado el HTML interno de las pestañas entre versiones,
+    y en la nube corre una version distinta a la que se probo esto la
+    primera vez, asi que se cubren ambas formas. */
+    .stTabs [data-baseweb="tab-list"],
+    div[data-testid="stTabs"] [role="tablist"] {{
         gap: 6px;
         background-color: transparent;
         border-bottom: 2px solid rgba(198, 161, 91, 0.55);
         padding-left: 2px;
     }}
-    .stTabs [data-baseweb="tab"] {{
+    .stTabs [data-baseweb="tab"],
+    div[data-testid="stTabs"] button[role="tab"] {{
         background-color: #F5F1E8;
         border: 1px solid rgba(198, 161, 91, 0.4);
         border-bottom: none;
         border-radius: 10px 10px 0 0;
         padding: 10px 22px;
-        color: #4a4740;
+        color: #4a4740 !important;
         font-weight: 500;
         transition: background-color 0.15s ease, color 0.15s ease;
     }}
-    .stTabs [data-baseweb="tab"]:hover {{
+    .stTabs [data-baseweb="tab"]:hover,
+    div[data-testid="stTabs"] button[role="tab"]:hover {{
         background-color: #EFE3C4;
-        color: #161412;
+        color: #161412 !important;
     }}
-    .stTabs [aria-selected="true"] {{
+    .stTabs [aria-selected="true"],
+    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
         background-color: #161412 !important;
         border-color: #161412 !important;
         color: var(--comsas-gold) !important;
         font-weight: 600;
     }}
-    .stTabs [aria-selected="true"] p {{
+    .stTabs [aria-selected="true"] p,
+    .stTabs [aria-selected="true"] *,
+    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] p,
+    div[data-testid="stTabs"] button[role="tab"][aria-selected="true"] * {{
         color: var(--comsas-gold) !important;
     }}
     /* la barra deslizante de subrayado ya no hace falta con pestañas en caja */
-    .stTabs [data-baseweb="tab-highlight"] {{
+    .stTabs [data-baseweb="tab-highlight"],
+    div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {{
         display: none;
     }}
-    .stTabs [data-baseweb="tab-border"] {{
+    .stTabs [data-baseweb="tab-border"],
+    div[data-testid="stTabs"] [data-baseweb="tab-border"] {{
         display: none;
     }}
-    .stTabs [data-baseweb="tab-panel"] {{
+    .stTabs [data-baseweb="tab-panel"],
+    div[data-testid="stTabs"] [data-testid="stTabsContent"] {{
         border: 1px solid rgba(198, 161, 91, 0.4);
         border-top: none;
         border-radius: 0 0 10px 10px;
