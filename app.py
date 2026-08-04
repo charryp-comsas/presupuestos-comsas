@@ -1801,8 +1801,24 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
     # -------------------------------------------------------------
     ws_flujo = wb.create_sheet("FLUJO DE CAJA")
     ws_flujo.cell(row=1, column=1, value="FLUJO DE CAJA (estimado, diario)").font = titulo_hoja
-    fila = 3
-    ws_flujo.append(["Dia", "Costos", "Ingresos", "Flujo neto", "Acumulado"])
+    ws_flujo.cell(
+        row=2, column=1,
+        value=(
+            "Cada ingreso se descompone proporcionalmente en Costo Directo, "
+            "Administracion, Imprevistos, Utilidad e IVA sobre Utilidad, segun "
+            "el peso de cada componente en el valor total del contrato -- base "
+            "para el control de costos."
+        ),
+    ).font = Font(italic=True, size=9)
+
+    # columnas: A Dia | B Costos | C Ingresos | D Costo Directo (del ingreso)
+    # | E Administracion | F Imprevistos | G Utilidad | H IVA Utilidad
+    # | I Flujo neto | J Acumulado
+    fila = 4
+    ws_flujo.append([
+        "Dia", "Costos", "Ingresos", "Costo Directo", "Administracion",
+        "Imprevistos", "Utilidad", "IVA Utilidad", "Flujo neto", "Acumulado",
+    ])
     for c in ws_flujo[fila]:
         c.font = negrita
         c.fill = relleno_encabezado
@@ -1814,6 +1830,16 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
     pago2_pct = float(presupuesto.get("pago2_pct") or 0.45)
     pagofin_pct = float(presupuesto.get("pagofin_pct") or 0.10)
     valor_total = aiu["valor_total"]
+
+    # proporcion fija de cada componente dentro del valor total del
+    # contrato -- se aplica a cualquier ingreso (anticipo, pago
+    # intermedio, pago final) porque el AIU es un % constante sobre el
+    # costo directo.
+    ratio_cd = (costo_directo / valor_total) if valor_total else 0
+    ratio_admin = (aiu["administracion"] / valor_total) if valor_total else 0
+    ratio_imprev = (aiu["imprevistos"] / valor_total) if valor_total else 0
+    ratio_util = (aiu["utilidad"] / valor_total) if valor_total else 0
+    ratio_iva_util = (aiu["iva_utilidad"] / valor_total) if valor_total else 0
 
     for d in range(1, num_dias + 1):
         col_cron = 4 + d
@@ -1844,23 +1870,40 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
         ws_flujo.cell(row=fila_r, column=3, value=formula_ingreso)
         ws_flujo.cell(row=fila_r, column=3).number_format = "$ #,##0"
 
-        ws_flujo.cell(row=fila_r, column=4, value=f"=C{fila_r}-B{fila_r}")
-        ws_flujo.cell(row=fila_r, column=4).number_format = "$ #,##0"
+        # desglose proporcional del ingreso del dia (columna C) en los
+        # componentes del AIU -- clave para el control de costos.
+        for col_destino, ratio in (
+            (4, ratio_cd),
+            (5, ratio_admin),
+            (6, ratio_imprev),
+            (7, ratio_util),
+            (8, ratio_iva_util),
+        ):
+            ws_flujo.cell(row=fila_r, column=col_destino, value=f"=C{fila_r}*{ratio}")
+            ws_flujo.cell(row=fila_r, column=col_destino).number_format = "$ #,##0"
+
+        ws_flujo.cell(row=fila_r, column=9, value=f"=C{fila_r}-B{fila_r}")
+        ws_flujo.cell(row=fila_r, column=9).number_format = "$ #,##0"
         if d == 1:
-            ws_flujo.cell(row=fila_r, column=5, value=f"=D{fila_r}")
+            ws_flujo.cell(row=fila_r, column=10, value=f"=I{fila_r}")
         else:
-            ws_flujo.cell(row=fila_r, column=5, value=f"=E{fila_r - 1}+D{fila_r}")
-        ws_flujo.cell(row=fila_r, column=5).number_format = "$ #,##0"
+            ws_flujo.cell(row=fila_r, column=10, value=f"=J{fila_r - 1}+I{fila_r}")
+        ws_flujo.cell(row=fila_r, column=10).number_format = "$ #,##0"
 
     fila_fin_flujo = fila_ini_flujo + num_dias - 1
     fila_total_flujo = fila_fin_flujo + 2
     ws_flujo.cell(row=fila_total_flujo, column=1, value="TOTAL").font = negrita
-    ws_flujo.cell(row=fila_total_flujo, column=2, value=f"=SUM(B{fila_ini_flujo}:B{fila_fin_flujo})").font = negrita
-    ws_flujo.cell(row=fila_total_flujo, column=3, value=f"=SUM(C{fila_ini_flujo}:C{fila_fin_flujo})").font = negrita
-    ws_flujo.cell(row=fila_total_flujo, column=2).number_format = "$ #,##0"
-    ws_flujo.cell(row=fila_total_flujo, column=3).number_format = "$ #,##0"
+    for col in range(2, 10):
+        letra_col = openpyxl.utils.get_column_letter(col)
+        if col == 9:
+            continue
+        ws_flujo.cell(
+            row=fila_total_flujo, column=col,
+            value=f"=SUM({letra_col}{fila_ini_flujo}:{letra_col}{fila_fin_flujo})",
+        ).font = negrita
+        ws_flujo.cell(row=fila_total_flujo, column=col).number_format = "$ #,##0"
 
-    for col, ancho in zip("ABCDE", (8, 16, 16, 16, 16)):
+    for col, ancho in zip("ABCDEFGHIJ", (8, 16, 16, 16, 16, 16, 16, 16, 16, 16)):
         ws_flujo.column_dimensions[col].width = ancho
 
     # -------------------------------------------------------------
