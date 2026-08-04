@@ -250,6 +250,16 @@ def es_admin():
     return bool(u) and u.get("rol") == "administrador"
 
 
+def es_gestor():
+    """Administrador o Cotizador: ambos pueden crear/editar catalogo, APUs,
+    cuadrillas, tarifas de personal y la receta de un APU. Las unicas dos
+    acciones que quedan reservadas solo a 'administrador' son escalar
+    precios (ICOCED) y aplicar precios desde facturas -- esas siguen
+    usando es_admin() directamente."""
+    u = usuario_actual()
+    return bool(u) and u.get("rol") in ("administrador", "cotizador")
+
+
 def _usuario_bitacora():
     """Correo del usuario conectado, para dejar registrado en la bitacora
     de cambios de precios/APU quien hizo cada modificacion. 'sistema' es
@@ -433,12 +443,20 @@ with st.sidebar:
     )
     if st.button("Cerrar sesion"):
         cerrar_sesion()
-    if not es_admin():
+    if _rol_actual == "operador":
         st.caption(
             "Modo operador: puedes usar todas las pestañas y trabajar presupuestos "
             "libremente. Los cambios que alteran el catalogo en general (precios de "
             "insumos, cuadrillas, tarifas de personal, receta de un APU) estan "
-            "reservados a un administrador -- veras esos botones deshabilitados."
+            "reservados a un administrador o cotizador -- veras esos botones "
+            "deshabilitados."
+        )
+    elif _rol_actual == "cotizador":
+        st.caption(
+            "Modo cotizador: mismos permisos que administrador (catalogo, APUs, "
+            "cuadrillas, tarifas, presupuestos), excepto escalar precios (ICOCED) "
+            "y aplicar precios desde facturas -- esos dos botones quedan "
+            "reservados a un administrador."
         )
     st.divider()
 
@@ -496,6 +514,80 @@ def calcular_aiu(costo_directo, administracion_pct, imprevistos_pct, utilidad_pc
         "aiu_total_pct": aiu_total_pct,
         "aiu_total_valor": aiu_total_valor,
         "valor_total": valor_total,
+    }
+
+
+# ---------------------------------------------------------------------
+# Fase 6: margen real de la empresa -- distinto del AIU que ve el
+# cliente. Regla de negocio (2026-08-03): el costo de cada APU (de
+# COSTOS, tal como esta en catalogo_apu) se aumenta con este margen
+# ANTES de aplicar el AIU. Ese costo aumentado es el "Costo Directo" que
+# entra al AIU y termina en el precio que ve el cliente. El costo SIN
+# aumentar es el "Costo real" que de verdad le cuesta a la empresa
+# ejecutar la obra -- nunca se le muestra al cliente.
+# ---------------------------------------------------------------------
+def obtener_margen_real_pct(sb, presupuesto):
+    """% de margen real a usar para este presupuesto: el que tenga
+    guardado el presupuesto (override por proyecto) o, si no tiene, el
+    default global de parametros.margen_real_pct."""
+    valor_presupuesto = presupuesto.get("margen_real_pct") if presupuesto else None
+    if valor_presupuesto is not None:
+        return float(valor_presupuesto)
+    return float(obtener_parametro(sb, "margen_real_pct", "25")) / 100
+
+
+def aplicar_margen_items(items, margen_real_pct):
+    """Devuelve una copia de 'items' con precio_unitario_snapshot
+    aumentado por el margen real -- esto es lo que se le presenta al
+    cliente (Word, Excel de respaldo, cronograma/flujo de caja). Los
+    'items' originales (sin aumentar) siguen siendo el costo real."""
+    factor = 1 + float(margen_real_pct)
+    ajustados = []
+    for it in items:
+        nuevo = dict(it)
+        nuevo["precio_unitario_snapshot"] = round(float(it["precio_unitario_snapshot"]) * factor, 0)
+        ajustados.append(nuevo)
+    return ajustados
+
+
+def agrupar_por_capitulo(items):
+    por_capitulo = {}
+    for it in items:
+        nombre_cap = (it.get("presupuesto_capitulos") or {}).get("nombre", "Sin capitulo")
+        por_capitulo.setdefault(nombre_cap, []).append(it)
+    return por_capitulo
+
+
+def calcular_apu_precio_presentacion(apu, margen_real_pct):
+    """Transforma un APU de COSTOS (catalogo_apu) en su version 'a
+    precio de presentacion' para el cliente:
+      1. La supervision (SISO/Residente/Director) se absorbe dentro de
+         mano de obra y se quita como linea aparte -- el cliente ve un
+         solo costo de mano de obra por actividad, no el detalle de
+         quien la supervisa.
+      2. Sobre ese costo (ya con la supervision adentro) se distribuye
+         el margen real de la empresa, aumentando equipo/materiales/
+         transporte/mano_obra en la misma proporcion.
+    El total resultante coincide con precio_unitario_snapshot * (1 +
+    margen_real_pct) que se usa en el resto del presupuesto -- solo
+    cambia como se reparte ese total entre las columnas."""
+    factor = 1 + float(margen_real_pct)
+    mano_obra_con_supervision = float(apu.get("mano_obra") or 0) + float(apu.get("personal_supervision") or 0)
+    return {
+        "equipo": round(float(apu.get("equipo") or 0) * factor, 0),
+        "materiales": round(float(apu.get("materiales") or 0) * factor, 0),
+        "transporte": round(float(apu.get("transporte") or 0) * factor, 0),
+        "mano_obra": round(mano_obra_con_supervision * factor, 0),
+        "total": round(
+            (
+                float(apu.get("equipo") or 0)
+                + float(apu.get("materiales") or 0)
+                + float(apu.get("transporte") or 0)
+                + mano_obra_con_supervision
+            )
+            * factor,
+            0,
+        ),
     }
 
 
@@ -884,7 +976,8 @@ def generar_propuesta_docx(plantilla_path, presupuesto, items, por_capitulo, tot
     ]
     hoy = date.today()
     fecha_txt = f"{hoy.day} de {meses_es[hoy.month - 1]} de {hoy.year}"
-    plazo_dias = int(round(float(presupuesto.get("plazo_meses") or 0) * 30))
+    plazo_dias = presupuesto.get("plazo_dias")
+    plazo_dias = int(round(float(plazo_dias))) if plazo_dias else int(round(float(presupuesto.get("plazo_meses") or 0) * 30))
     valor_total = aiu["valor_total"]
     letras = numero_a_letras(valor_total)
     valor_txt = (
@@ -1105,10 +1198,78 @@ def _insertar_logo_excel(ws, celda_ancla="H2", ancho_px=140):
         pass
 
 
-def generar_excel_respaldo(presupuesto, items, por_capitulo, total_general, aiu):
+def _escribir_hoja_apus_presentacion(sb, wb, items, margen_real_pct):
+    """Agrega al libro una hoja 'APUS' con el desglose de cada actividad
+    del presupuesto A PRECIO DE PRESENTACION: con el margen real de la
+    empresa ya incluido y la supervision (SISO/Residente/Director)
+    absorbida dentro de mano de obra (sin mostrarla como linea aparte).
+    El total de cada APU aqui coincide con el precio unitario que se le
+    presenta al cliente en el presupuesto -- son los mismos APUs de
+    COSTOS del catalogo, pasados por calcular_apu_precio_presentacion()."""
+    from openpyxl.styles import Border, Font, PatternFill, Side
+
+    negrita = Font(bold=True)
+    negrita_grande = Font(bold=True, size=13)
+    relleno_encabezado = PatternFill("solid", fgColor="D9D9D9")
+    borde_top = Border(top=Side(style="thin"))
+
+    codigos_apu = sorted({it["apu_codigo"] for it in items if it.get("apu_codigo")})
+    ws = wb.create_sheet("APUS")
+    ws.cell(
+        row=1, column=1,
+        value="APUs A PRECIO DE PRESENTACION (incluye el margen real de la empresa)",
+    ).font = negrita_grande
+    ws.cell(
+        row=2, column=1,
+        value=(
+            "La supervision (SISO/Residente/Director) queda incluida dentro de MANO DE "
+            "OBRA -- no se muestra como linea aparte. Estos totales ya incluyen el margen "
+            "real de la empresa y coinciden con los precios unitarios de este presupuesto."
+        ),
+    )
+    fila = 4
+    for codigo in codigos_apu:
+        apu = obtener_apu_detalle(sb, codigo)
+        if not apu:
+            ws.cell(row=fila, column=1, value=f"{codigo} -- no encontrado en el catalogo")
+            fila += 2
+            continue
+        pres = calcular_apu_precio_presentacion(apu, margen_real_pct)
+        ws.cell(
+            row=fila, column=1, value=f"{codigo} - {apu['descripcion']} ({apu['unidad']})"
+        ).font = negrita_grande
+        fila += 1
+        ws.append(["Concepto", "Valor"])
+        for c in ws[fila]:
+            c.font = negrita
+            c.fill = relleno_encabezado
+        fila += 1
+        for etiqueta, valor in (
+            ("EQUIPO", pres["equipo"]),
+            ("MATERIALES", pres["materiales"]),
+            ("TRANSPORTE", pres["transporte"]),
+            ("MANO DE OBRA (incluye supervision)", pres["mano_obra"]),
+        ):
+            ws.cell(row=fila, column=1, value=etiqueta)
+            c_val = ws.cell(row=fila, column=2, value=valor)
+            c_val.number_format = "$ #,##0"
+            fila += 1
+        ws.cell(row=fila, column=1, value=f"TOTAL {codigo} (precio de presentacion)").font = negrita
+        c_total = ws.cell(row=fila, column=2, value=pres["total"])
+        c_total.font = negrita
+        c_total.number_format = "$ #,##0"
+        c_total.border = borde_top
+        fila += 3
+
+    ws.column_dimensions["A"].width = 55
+    ws.column_dimensions["B"].width = 16
+
+
+def generar_excel_respaldo(sb, presupuesto, items, por_capitulo, total_general, aiu, margen_real_pct):
     """Respaldo simple en .xlsx (sin macros): todo con formulas reales,
     excepto el texto SON: que queda fijo (Excel no tiene forma de
-    escribir un numero en letras sin una macro)."""
+    escribir un numero en letras sin una macro). Incluye una hoja APUS
+    con el detalle de cada actividad a precio de presentacion."""
     import openpyxl
 
     filas = construir_filas_institucional(presupuesto, por_capitulo, total_general, aiu)
@@ -1117,6 +1278,7 @@ def generar_excel_respaldo(presupuesto, items, por_capitulo, total_general, aiu)
     ws.title = "PRESUPUESTO"
     _escribir_filas_institucional(ws, filas, usar_formula_letras=False)
     _insertar_logo_excel(ws)
+    _escribir_hoja_apus_presentacion(sb, wb, items, margen_real_pct)
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -1124,7 +1286,9 @@ def generar_excel_respaldo(presupuesto, items, por_capitulo, total_general, aiu)
     return buffer
 
 
-def generar_excel_respaldo_macro(presupuesto, items, por_capitulo, total_general, aiu, plantilla_macro_path):
+def generar_excel_respaldo_macro(
+    sb, presupuesto, items, por_capitulo, total_general, aiu, plantilla_macro_path, margen_real_pct
+):
     """Respaldo en .xlsm partiendo de PLANTILLA_MACRO_LETRAS.xlsm -- un
     archivo "portador" que el usuario crea una sola vez en Excel y que
     SOLO contiene la macro Nlet (copiada de tu ModArmar.bas), sin ninguna
@@ -1150,6 +1314,7 @@ def generar_excel_respaldo_macro(presupuesto, items, por_capitulo, total_general
 
     _escribir_filas_institucional(ws, filas, usar_formula_letras=True)
     _insertar_logo_excel(ws)
+    _escribir_hoja_apus_presentacion(sb, wb, items, margen_real_pct)
 
     # Ademas de ocultarlas, protege la ESTRUCTURA del libro (no el
     # contenido de las celdas) para que la opcion "Mostrar" de Excel
@@ -1178,7 +1343,7 @@ def generar_excel_respaldo_macro(presupuesto, items, por_capitulo, total_general
 # cargo, o una cantidad, se recalcula solo en cadena.
 # NO se manda al cliente: es para uso interno del equipo.
 # ---------------------------------------------------------------------
-def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_directo, aiu):
+def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_directo, aiu, usar_curva_s=False):
     import math
 
     import openpyxl
@@ -1499,26 +1664,36 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
         ws_lista.column_dimensions[col].width = ancho
 
     # -------------------------------------------------------------
-    # 5. Hoja CRONOGRAMA: reparte cada capitulo en el plazo, usando
-    #    dias reales (cantidad/rendimiento_dia de la cuadrilla) cuando
-    #    estan disponibles; si no, un reparto proporcional al peso del
-    #    capitulo sobre el costo directo (aproximado -- se nota en la
-    #    hoja).
+    # 5. Hoja CRONOGRAMA: reparte cada capitulo en el plazo, EN DIAS
+    #    (regla de negocio 2026-08-03: ya no se reparte por mes ni por
+    #    semana). Dos formas de repartir cada dia dentro de la duracion
+    #    del capitulo:
+    #      - lineal: el valor del capitulo se divide en partes iguales
+    #        entre sus dias.
+    #      - curva S: el avance sigue una curva lenta-rapido-lenta
+    #        (smoothstep) tipica de obra, tambien calculada dia a dia.
+    #    La duracion de cada capitulo sale de dias reales (cantidad/
+    #    rendimiento_dia de la cuadrilla) cuando estan disponibles; si
+    #    no, un reparto proporcional al peso del capitulo sobre el
+    #    costo directo.
     # -------------------------------------------------------------
     ws_cron = wb.create_sheet("CRONOGRAMA")
-    plazo_meses = float(presupuesto.get("plazo_meses") or 1) or 1
-    num_meses = max(1, math.ceil(plazo_meses))
-    ws_cron.cell(row=1, column=1, value="CRONOGRAMA (reparto estimado por mes)").font = titulo_hoja
+    plazo_dias_presu = float(presupuesto.get("plazo_dias") or 0)
+    if not plazo_dias_presu:
+        plazo_dias_presu = float(presupuesto.get("plazo_meses") or 1) * 30
+    num_dias = max(1, math.ceil(plazo_dias_presu))
+    ws_cron.cell(row=1, column=1, value="CRONOGRAMA (reparto estimado por dia)").font = titulo_hoja
     ws_cron.cell(
         row=2, column=1,
         value=(
-            "Duracion de cada capitulo: dias reales (cantidad/rendimiento de la cuadrilla) cuando "
-            "hay cuadrilla asignada; si no, proporcional al peso del capitulo sobre el costo directo."
+            f"Reparto {'curva S' if usar_curva_s else 'lineal'} -- duracion de cada capitulo: dias "
+            "reales (cantidad/rendimiento de la cuadrilla) cuando hay cuadrilla asignada; si no, "
+            "proporcional al peso del capitulo sobre el costo directo."
         ),
     )
     fila = 4
-    encabezados_cron = ["Capitulo", "Subtotal", "% del total", "Duracion (meses)"] + [
-        f"Mes {m}" for m in range(1, num_meses + 1)
+    encabezados_cron = ["Capitulo", "Subtotal", "% del total", "Duracion (dias)"] + [
+        f"Dia {d}" for d in range(1, num_dias + 1)
     ]
     ws_cron.append(encabezados_cron)
     for c in ws_cron[fila]:
@@ -1526,7 +1701,14 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
         c.fill = relleno_encabezado
     fila += 1
 
-    mes_actual_inicio = 0.0
+    def _fraccion_curva_s(t):
+        """Smoothstep: avance acumulado 0..1 lento-rapido-lento, la curva
+        S clasica de obra. t es el avance de tiempo relativo (0..1)
+        dentro de la duracion del capitulo."""
+        t = min(1.0, max(0.0, t))
+        return t * t * (3 - 2 * t)
+
+    dia_actual_inicio = 0.0
     filas_capitulos_cron = []
     for nombre_cap, filas_cap in por_capitulo.items():
         subtotal_cap = sum(float(x["cantidad"]) * float(x["precio_unitario_snapshot"]) for x in filas_cap)
@@ -1543,34 +1725,43 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
             else:
                 todos_con_rendimiento = False
         if todos_con_rendimiento and dias_reales > 0:
-            duracion_meses = round(dias_reales / 30.0, 2)
+            duracion_dias = round(dias_reales, 2)
         else:
-            duracion_meses = round(max(peso * plazo_meses, 0.25), 2)
+            duracion_dias = round(max(peso * num_dias, 1.0), 2)
 
-        mes_inicio = mes_actual_inicio
-        mes_fin = mes_inicio + duracion_meses
-        mes_actual_inicio = mes_fin
+        dia_inicio = dia_actual_inicio
+        dia_fin = dia_inicio + duracion_dias
+        dia_actual_inicio = dia_fin
 
         fila_cap_row = fila
         ws_cron.cell(row=fila, column=1, value=nombre_cap)
         ws_cron.cell(row=fila, column=2, value=subtotal_cap).number_format = "$ #,##0"
         ws_cron.cell(row=fila, column=3, value=f"=B{fila}/{costo_directo}" if costo_directo else 0)
         ws_cron.cell(row=fila, column=3).number_format = "0.0%"
-        ws_cron.cell(row=fila, column=4, value=duracion_meses)
-        for m in range(1, num_meses + 1):
-            col = 4 + m
-            # fraccion de este mes calendario que cae dentro de [mes_inicio, mes_fin)
-            solape = max(0.0, min(m, mes_fin) - max(m - 1, mes_inicio - 1))
-            fraccion = min(1.0, max(0.0, solape))
-            valor_mes = round(fraccion * (subtotal_cap / duracion_meses), 2) if duracion_meses else 0
-            ws_cron.cell(row=fila, column=col, value=valor_mes).number_format = "$ #,##0"
+        ws_cron.cell(row=fila, column=4, value=duracion_dias)
+
+        if usar_curva_s:
+            acumulado_anterior = 0.0
+            for d in range(1, num_dias + 1):
+                t = (d - dia_inicio) / duracion_dias if duracion_dias else 0
+                acumulado_hoy = _fraccion_curva_s(t)
+                valor_dia = round((acumulado_hoy - acumulado_anterior) * subtotal_cap, 2)
+                acumulado_anterior = acumulado_hoy
+                ws_cron.cell(row=fila, column=4 + d, value=valor_dia).number_format = "$ #,##0"
+        else:
+            for d in range(1, num_dias + 1):
+                # fraccion de este dia que cae dentro de [dia_inicio, dia_fin)
+                solape = max(0.0, min(d, dia_fin) - max(d - 1, dia_inicio))
+                fraccion = min(1.0, max(0.0, solape))
+                valor_dia = round(fraccion * (subtotal_cap / duracion_dias), 2) if duracion_dias else 0
+                ws_cron.cell(row=fila, column=4 + d, value=valor_dia).number_format = "$ #,##0"
         filas_capitulos_cron.append(fila_cap_row)
         fila += 1
 
-    fila_totales_mes = fila
-    ws_cron.cell(row=fila, column=1, value="TOTAL MES").font = negrita
-    for m in range(1, num_meses + 1):
-        col = 4 + m
+    fila_totales_dia = fila
+    ws_cron.cell(row=fila, column=1, value="TOTAL DIA").font = negrita
+    for d in range(1, num_dias + 1):
+        col = 4 + d
         letra = openpyxl.utils.get_column_letter(col)
         if filas_capitulos_cron:
             ws_cron.cell(
@@ -1585,32 +1776,33 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
 
     fila_acumulado = fila
     ws_cron.cell(row=fila, column=1, value="ACUMULADO (%)")
-    for m in range(1, num_meses + 1):
-        col = 4 + m
+    for d in range(1, num_dias + 1):
+        col = 4 + d
         letra = openpyxl.utils.get_column_letter(col)
-        letra_ant = openpyxl.utils.get_column_letter(col - 1) if m > 1 else None
+        letra_ant = openpyxl.utils.get_column_letter(col - 1) if d > 1 else None
         if costo_directo:
-            if m == 1:
-                formula = f"={letra}{fila_totales_mes}/{costo_directo}"
+            if d == 1:
+                formula = f"={letra}{fila_totales_dia}/{costo_directo}"
             else:
-                formula = f"={letra_ant}{fila}+{letra}{fila_totales_mes}/{costo_directo}"
+                formula = f"={letra_ant}{fila}+{letra}{fila_totales_dia}/{costo_directo}"
         else:
             formula = 0
         ws_cron.cell(row=fila, column=col, value=formula)
         ws_cron.cell(row=fila, column=col).number_format = "0.0%"
 
     ws_cron.column_dimensions["A"].width = 32
-    for col in range(2, 5 + num_meses):
+    for col in range(2, 5 + num_dias):
         ws_cron.column_dimensions[openpyxl.utils.get_column_letter(col)].width = 14
 
     # -------------------------------------------------------------
-    # 6. Hoja FLUJO DE CAJA: costos mensuales (del cronograma) vs
-    #    ingresos segun las condiciones de pago del presupuesto.
+    # 6. Hoja FLUJO DE CAJA: costos diarios (del cronograma) vs
+    #    ingresos segun las condiciones de pago del presupuesto --
+    #    tambien dia a dia, no por mes/semana.
     # -------------------------------------------------------------
     ws_flujo = wb.create_sheet("FLUJO DE CAJA")
-    ws_flujo.cell(row=1, column=1, value="FLUJO DE CAJA (estimado)").font = titulo_hoja
+    ws_flujo.cell(row=1, column=1, value="FLUJO DE CAJA (estimado, diario)").font = titulo_hoja
     fila = 3
-    ws_flujo.append(["Mes", "Costos", "Ingresos", "Flujo neto", "Acumulado"])
+    ws_flujo.append(["Dia", "Costos", "Ingresos", "Flujo neto", "Acumulado"])
     for c in ws_flujo[fila]:
         c.font = negrita
         c.fill = relleno_encabezado
@@ -1623,31 +1815,30 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
     pagofin_pct = float(presupuesto.get("pagofin_pct") or 0.10)
     valor_total = aiu["valor_total"]
 
-    letra_acum_cron = None
-    for m in range(1, num_meses + 1):
-        col_cron = 4 + m
+    for d in range(1, num_dias + 1):
+        col_cron = 4 + d
         letra_acum_cron = openpyxl.utils.get_column_letter(col_cron)
-        letra_costo_mes = openpyxl.utils.get_column_letter(col_cron)
-        fila_r = fila_ini_flujo + m - 1
-        ws_flujo.cell(row=fila_r, column=1, value=m)
+        letra_costo_dia = openpyxl.utils.get_column_letter(col_cron)
+        fila_r = fila_ini_flujo + d - 1
+        ws_flujo.cell(row=fila_r, column=1, value=d)
         ws_flujo.cell(
             row=fila_r, column=2,
-            value=f"=CRONOGRAMA!{letra_costo_mes}{fila_totales_mes}",
+            value=f"=CRONOGRAMA!{letra_costo_dia}{fila_totales_dia}",
         )
         ws_flujo.cell(row=fila_r, column=2).number_format = "$ #,##0"
 
-        # ingreso: anticipo en el mes 1; saldo final en el ultimo mes;
-        # el pago intermedio se paga el primer mes en que el acumulado
-        # del cronograma alcanza el % de avance pactado.
+        # ingreso: anticipo el dia 1; saldo final el ultimo dia; el pago
+        # intermedio se paga el primer dia en que el acumulado del
+        # cronograma alcanza el % de avance pactado.
         condiciones = []
-        if m == 1:
+        if d == 1:
             condiciones.append(f"{anticipo_pct}*{valor_total}")
         condiciones.append(
             f'IF(AND(CRONOGRAMA!{letra_acum_cron}{fila_acumulado}>={avance2_pct},'
-            f'OR({m}=1,CRONOGRAMA!{openpyxl.utils.get_column_letter(col_cron-1) if m>1 else letra_acum_cron}{fila_acumulado}<{avance2_pct})),'
+            f'OR({d}=1,CRONOGRAMA!{openpyxl.utils.get_column_letter(col_cron-1) if d>1 else letra_acum_cron}{fila_acumulado}<{avance2_pct})),'
             f"{pago2_pct}*{valor_total},0)"
         )
-        if m == num_meses:
+        if d == num_dias:
             condiciones.append(f"{pagofin_pct}*{valor_total}")
         formula_ingreso = "=" + "+".join(condiciones)
         ws_flujo.cell(row=fila_r, column=3, value=formula_ingreso)
@@ -1655,13 +1846,13 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
 
         ws_flujo.cell(row=fila_r, column=4, value=f"=C{fila_r}-B{fila_r}")
         ws_flujo.cell(row=fila_r, column=4).number_format = "$ #,##0"
-        if m == 1:
+        if d == 1:
             ws_flujo.cell(row=fila_r, column=5, value=f"=D{fila_r}")
         else:
             ws_flujo.cell(row=fila_r, column=5, value=f"=E{fila_r - 1}+D{fila_r}")
         ws_flujo.cell(row=fila_r, column=5).number_format = "$ #,##0"
 
-    fila_fin_flujo = fila_ini_flujo + num_meses - 1
+    fila_fin_flujo = fila_ini_flujo + num_dias - 1
     fila_total_flujo = fila_fin_flujo + 2
     ws_flujo.cell(row=fila_total_flujo, column=1, value="TOTAL").font = negrita
     ws_flujo.cell(row=fila_total_flujo, column=2, value=f"=SUM(B{fila_ini_flujo}:B{fila_fin_flujo})").font = negrita
@@ -1691,12 +1882,12 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
         ("IVA utilidad", aiu["iva_utilidad"]),
         ("Valor del contrato", aiu["valor_total"]),
         ("Total materiales a comprar", f"=('LISTA DE MATERIALES'!F{fila_total_materiales})"),
-        ("Plazo (meses)", plazo_meses),
+        ("Plazo (dias)", num_dias),
     ]
     for etiqueta, valor in resumen:
         ws_dash.cell(row=fila, column=1, value=etiqueta).font = negrita
         c = ws_dash.cell(row=fila, column=2, value=valor)
-        if etiqueta != "Plazo (meses)":
+        if etiqueta != "Plazo (dias)":
             c.number_format = "$ #,##0"
         fila += 1
 
@@ -1724,9 +1915,9 @@ def generar_excel_manejo_interno(sb, presupuesto, items, por_capitulo, costo_dir
     ws_dash.add_chart(grafico_cap, f"D{fila_tabla_cap}")
 
     grafico_curva = LineChart()
-    grafico_curva.title = "Curva S (avance acumulado %)"
+    grafico_curva.title = "Curva de avance acumulado % (diaria)"
     datos_curva = Reference(
-        ws_dash.parent["CRONOGRAMA"], min_col=5, max_col=4 + num_meses, min_row=fila_acumulado
+        ws_dash.parent["CRONOGRAMA"], min_col=5, max_col=4 + num_dias, min_row=fila_acumulado
     )
     grafico_curva.add_data(datos_curva, titles_from_data=False)
     grafico_curva.height, grafico_curva.width = 8, 16
@@ -2580,6 +2771,62 @@ def buscar_insumos_catalogo(sb, texto, limite=20):
     )
 
 
+def _siguiente_numero_codigo(codigos_existentes, prefijo):
+    """Dado un listado de codigos 'PREFIJO-0001' y un prefijo, calcula el
+    siguiente numero consecutivo y el ancho (cantidad de digitos) a usar
+    -- toma el ancho del codigo mas reciente con ese prefijo para no
+    romper el formato (ej. insumos usan 4 digitos, APUs usan 3)."""
+    prefijo = prefijo.strip().upper()
+    numeros = []
+    ancho = 3
+    for c in codigos_existentes:
+        if not c:
+            continue
+        c = c.strip().upper()
+        if "-" not in c:
+            continue
+        pre, _, num = c.rpartition("-")
+        if pre != prefijo or not num.isdigit():
+            continue
+        numeros.append(int(num))
+        ancho = max(ancho, len(num))
+    siguiente = (max(numeros) + 1) if numeros else 1
+    return siguiente, ancho
+
+
+def siguiente_codigo_insumo(sb, prefijo="MAT"):
+    """Siguiente codigo libre para un insumo nuevo, ej. 'MAT-2201' si el
+    ultimo insumo MAT- que existe es 'MAT-2200'. Evita que dos personas
+    inventen el mismo codigo a mano y se sobreescriban sin darse cuenta."""
+    prefijo = (prefijo or "MAT").strip().upper()
+    filas = (
+        sb.table("insumos")
+        .select("codigo")
+        .ilike("codigo", f"{prefijo}-%")
+        .execute()
+        .data
+    )
+    siguiente, ancho = _siguiente_numero_codigo([f["codigo"] for f in filas], prefijo)
+    return f"{prefijo}-{siguiente:0{ancho}d}"
+
+
+def siguiente_codigo_apu(sb, categoria):
+    """Siguiente codigo libre para un APU nuevo dentro de un capitulo/
+    categoria, ej. 'PIN-066' si el ultimo PIN- que existe es 'PIN-065'."""
+    categoria = (categoria or "").strip().upper()
+    if not categoria:
+        return ""
+    filas = (
+        sb.table("catalogo_apu")
+        .select("codigo")
+        .eq("categoria", categoria)
+        .execute()
+        .data
+    )
+    siguiente, ancho = _siguiente_numero_codigo([f["codigo"] for f in filas], categoria)
+    return f"{categoria}-{siguiente:0{ancho}d}"
+
+
 def crear_insumo_nuevo(sb, codigo, descripcion, unidad, precio, proveedor=None, marcar_cotizado=True):
     """Da de alta un insumo que todavia no existe en la tabla insumos --
     antes de esto, solo se podian enlazar insumos ya cargados desde el
@@ -2727,6 +2974,36 @@ def guardar_receta_apu(sb, apu_codigo, apu_original, df_insumos, df_fijos, equip
     sb.table("catalogo_apu").update(actualizacion).eq("codigo", apu_codigo).execute()
 
 
+def calcular_plazo_dias_sugerido(sb, items):
+    """Plazo sugerido = suma de los dias de cada actividad del presupuesto
+    (cantidad / rendimiento_dia del APU), tratando todo como secuencial --
+    la opcion simple y conservadora que se definio como regla de negocio
+    el 2026-08-03. Devuelve (dias_sugeridos, [codigos sin rendimiento
+    definido que no se pudieron contar])."""
+    codigos = sorted({it["apu_codigo"] for it in items if it.get("apu_codigo")})
+    rendimientos = {}
+    if codigos:
+        filas = (
+            sb.table("catalogo_apu")
+            .select("codigo, rendimiento_dia")
+            .in_("codigo", codigos)
+            .execute()
+            .data
+        )
+        rendimientos = {f["codigo"]: f.get("rendimiento_dia") for f in filas}
+
+    total_dias = 0.0
+    sin_rendimiento = []
+    for it in items:
+        cod = it.get("apu_codigo")
+        rend = rendimientos.get(cod) if cod else None
+        if rend and float(rend) > 0:
+            total_dias += float(it["cantidad"]) / float(rend)
+        else:
+            sin_rendimiento.append(cod or it.get("descripcion_snapshot") or "(sin codigo)")
+    return round(total_dias, 1), sin_rendimiento
+
+
 # ---------------------------------------------------------------------
 # Estado de sesion
 # ---------------------------------------------------------------------
@@ -2755,6 +3032,11 @@ tab_nuevo, tab_catalogo, tab_resumen, tab_aiu, tab_precios, tab_editor_apu = st.
 # ---------------------------------------------------------------------
 with tab_nuevo:
     st.subheader("Crear presupuesto nuevo")
+    st.caption(
+        "El plazo ya NO se pregunta aqui -- se calcula solo, a partir del rendimiento "
+        "de las actividades que agregues, en la pestaña '3. Resumen y total' (y ahi "
+        "mismo lo puedes ajustar a mano si el que calcula la app queda corto o largo)."
+    )
     with st.form("form_nuevo_presupuesto"):
         col1, col2 = st.columns(2)
         with col1:
@@ -2762,7 +3044,6 @@ with tab_nuevo:
             proyecto = st.text_input("Proyecto")
         with col2:
             ubicacion = st.text_input("Ubicacion")
-            plazo_meses = st.number_input("Plazo (meses)", min_value=0.0, step=0.5)
         crear = st.form_submit_button("Crear presupuesto", type="primary")
 
     if crear:
@@ -2776,7 +3057,6 @@ with tab_nuevo:
                         "cliente": cliente,
                         "proyecto": proyecto,
                         "ubicacion": ubicacion,
-                        "plazo_meses": plazo_meses,
                         "estado": "borrador",
                     }
                 )
@@ -2893,6 +3173,7 @@ with tab_nuevo:
                                 "proyecto": proyecto_g,
                                 "ubicacion": ubicacion_g,
                                 "plazo_meses": plazo_g,
+                                "plazo_dias": round(plazo_g * 30, 1),
                                 "estado": "borrador",
                             }
                         )
@@ -3208,6 +3489,45 @@ with tab_resumen:
             ).eq("id", st.session_state.presupuesto_id).execute()
 
             st.divider()
+            st.subheader("Plazo de ejecucion")
+            plazo_sugerido, codigos_sin_rendimiento = calcular_plazo_dias_sugerido(sb, items)
+            st.caption(
+                f"Plazo sugerido segun rendimientos: **{plazo_sugerido:g} dias** "
+                "(suma de cantidad / rendimiento-dia de cada actividad, una tras otra). "
+                "Es un punto de partida -- ajustalo abajo si tu criterio dice que la app "
+                "se quedo corta o se paso."
+            )
+            if codigos_sin_rendimiento:
+                st.caption(
+                    f"{len(codigos_sin_rendimiento)} item(s) sin rendimiento/dia definido en "
+                    "su APU no se contaron para este calculo: "
+                    + ", ".join(codigos_sin_rendimiento[:15])
+                    + ("..." if len(codigos_sin_rendimiento) > 15 else "")
+                )
+            presu_plazo_actual = (
+                sb.table("presupuestos")
+                .select("plazo_dias")
+                .eq("id", st.session_state.presupuesto_id)
+                .single()
+                .execute()
+                .data
+            )
+            plazo_guardado = (presu_plazo_actual or {}).get("plazo_dias")
+            valor_inicial_plazo = float(plazo_guardado) if plazo_guardado else plazo_sugerido
+            plazo_dias_final = st.number_input(
+                "Plazo (dias) -- editable",
+                min_value=0.0,
+                step=1.0,
+                value=valor_inicial_plazo,
+                key="plazo_dias_editable",
+            )
+            if st.button("Guardar plazo"):
+                sb.table("presupuestos").update(
+                    {"plazo_dias": plazo_dias_final, "plazo_meses": round(plazo_dias_final / 30, 2)}
+                ).eq("id", st.session_state.presupuesto_id).execute()
+                st.success(f"Plazo guardado: {plazo_dias_final:g} dias.")
+
+            st.divider()
             st.subheader("Refrescar precios de este presupuesto")
             st.caption(
                 "Trae el precio actual del catalogo para los items que ya tienen apu_codigo "
@@ -3282,7 +3602,7 @@ with tab_aiu:
         if not items:
             st.info("Este presupuesto todavia no tiene items. Agrega algunos en la pestaña 2.")
         else:
-            costo_directo = presupuesto.get("costo_directo") or sum(
+            costo_real = presupuesto.get("costo_directo") or sum(
                 float(it["cantidad"]) * float(it["precio_unitario_snapshot"]) for it in items
             )
 
@@ -3312,10 +3632,39 @@ with tab_aiu:
                     st.caption("Presupuesto aprobado.")
             st.divider()
 
-            st.subheader("1. Administracion, Imprevistos, Utilidad (AIU)")
+            st.subheader("1. Margen real de la empresa")
             st.caption(
-                "Se calcula sobre el costo directo, igual que en PLANTILLA_AIU.xlsx. "
-                "Los porcentajes quedan guardados en el presupuesto."
+                "Este margen es aparte del AIU -- NO se le muestra al cliente como tal. Se "
+                "suma al costo de cada APU (de COSTOS) ANTES de calcular el AIU, y ese costo "
+                "aumentado es el que la app usa como 'Costo directo' para todo lo demas "
+                "(AIU, propuesta, Excel de respaldo). Por defecto es el mismo para todos los "
+                "proyectos (parametro global), pero se puede ajustar solo para este proyecto."
+            )
+            margen_real_pct_default = obtener_margen_real_pct(sb, presupuesto)
+            margen_real_pct_ui = st.number_input(
+                "% Margen real de la empresa", min_value=0.0, max_value=100.0, step=1.0,
+                value=margen_real_pct_default * 100, format="%.2f",
+            )
+            margen_real_pct = margen_real_pct_ui / 100
+
+            items_presentacion = aplicar_margen_items(items, margen_real_pct)
+            por_capitulo_presentacion = agrupar_por_capitulo(items_presentacion)
+            costo_directo = sum(
+                float(it["cantidad"]) * float(it["precio_unitario_snapshot"]) for it in items_presentacion
+            )
+
+            colm1, colm2 = st.columns(2)
+            with colm1:
+                st.metric("Costo real (lo que le cuesta a la empresa)", money(costo_real))
+            with colm2:
+                st.metric("Costo directo (con margen -- base del AIU)", money(costo_directo))
+
+            st.divider()
+
+            st.subheader("2. Administracion, Imprevistos, Utilidad (AIU)")
+            st.caption(
+                "Se calcula sobre el costo directo YA con el margen real incluido, igual que "
+                "en PLANTILLA_AIU.xlsx. Los porcentajes quedan guardados en el presupuesto."
             )
             st.write(f"**Costo directo:** {money(costo_directo)}")
 
@@ -3365,7 +3714,7 @@ with tab_aiu:
                 st.metric("Valor del contrato", money(aiu["valor_total"]))
 
             st.divider()
-            st.subheader("2. Datos para la propuesta")
+            st.subheader("3. Datos para la propuesta")
             colp1, colp2 = st.columns(2)
             with colp1:
                 atencion = st.text_input(
@@ -3419,7 +3768,8 @@ with tab_aiu:
                         "pagofin_pct": pagofin_pct,
                         "aiu_total": aiu["aiu_total_valor"],
                         "valor_total": aiu["valor_total"],
-                        "costo_directo": costo_directo,
+                        "margen_real_pct": margen_real_pct,
+                        "costo_directo_presentacion": costo_directo,
                     }
                 ).eq("id", st.session_state.presupuesto_id).execute()
                 presupuesto.update(
@@ -3439,7 +3789,7 @@ with tab_aiu:
                 st.success("Guardado.")
 
             st.divider()
-            st.subheader("3. Generar documentos")
+            st.subheader("4. Generar documentos")
 
             import os
 
@@ -3467,7 +3817,8 @@ with tab_aiu:
                         st.error(f"No encuentro la plantilla en: {plantilla_path}")
                     else:
                         buffer = generar_propuesta_docx(
-                            plantilla_path, presupuesto, items, por_capitulo, costo_directo, aiu
+                            plantilla_path, presupuesto, items_presentacion, por_capitulo_presentacion,
+                            costo_directo, aiu,
                         )
                         nombre = sanitizar_nombre_archivo(
                             f"PROPUESTA - {presupuesto.get('proyecto', 'presupuesto')[:60]}.docx"
@@ -3509,7 +3860,8 @@ with tab_aiu:
                     usa_macro = os.path.exists(plantilla_macro_path)
                     if usa_macro:
                         buffer_xlsx = generar_excel_respaldo_macro(
-                            presupuesto, items, por_capitulo, costo_directo, aiu, plantilla_macro_path
+                            sb, presupuesto, items_presentacion, por_capitulo_presentacion, costo_directo,
+                            aiu, plantilla_macro_path, margen_real_pct,
                         )
                         extension = "xlsm"
                         mime_xlsx = "application/vnd.ms-excel.sheet.macroEnabled.12"
@@ -3518,7 +3870,10 @@ with tab_aiu:
                             f"No encontre {plantilla_macro_path} -- genero el respaldo sin macro "
                             "(el valor en letras queda fijo, no se recalcula solo)."
                         )
-                        buffer_xlsx = generar_excel_respaldo(presupuesto, items, por_capitulo, costo_directo, aiu)
+                        buffer_xlsx = generar_excel_respaldo(
+                            sb, presupuesto, items_presentacion, por_capitulo_presentacion, costo_directo,
+                            aiu, margen_real_pct,
+                        )
                         extension = "xlsx"
                         mime_xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -3555,11 +3910,18 @@ with tab_aiu:
             st.divider()
             st.caption(
                 "Excel de manejo interno (Cronograma, Lista de materiales, Flujo de caja, "
-                "Dashboard y APUs) -- solo para el equipo, NO se le manda al cliente."
+                "Dashboard y APUs) -- solo para el equipo, NO se le manda al cliente. El "
+                "cronograma y el flujo de caja ya son diarios (no por mes/semana)."
+            )
+            usar_curva_s_ui = st.checkbox(
+                "Repartir el cronograma con curva S (en vez de reparto lineal por dia)",
+                value=False,
+                key="usar_curva_s",
             )
             if st.button("Generar Excel de manejo interno"):
                 buffer_interno = generar_excel_manejo_interno(
-                    sb, presupuesto, items, por_capitulo, costo_directo, aiu
+                    sb, presupuesto, items_presentacion, por_capitulo_presentacion, costo_directo, aiu,
+                    usar_curva_s_ui,
                 )
                 nombre_interno = sanitizar_nombre_archivo(
                     f"MANEJO INTERNO - {presupuesto.get('proyecto', 'presupuesto')[:60]}.xlsx"
@@ -3894,9 +4256,9 @@ with tab_precios:
                 "si solo DIRIGE varias cuadrillas a la vez (ej. 4 en obra civil, "
                 "muros, demoliciones); ahi su costo se divide entre esos frentes."
             )
-            if not es_admin():
-                st.caption("Solo un administrador puede crear cuadrillas.")
-            if st.button("Crear cuadrilla", type="primary", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede crear cuadrillas.")
+            if st.button("Crear cuadrilla", type="primary", disabled=not es_gestor()):
                 codigo_norm = codigo_nuevo.strip().upper()
                 if not codigo_norm or not nombre_nuevo:
                     st.error("Codigo y nombre son obligatorios.")
@@ -3931,9 +4293,9 @@ with tab_precios:
                     "Activa", value=bool(cuadrilla_actual["activo"]), key=f"activo_{codigo_activo}"
                 )
 
-            if not es_admin():
-                st.caption("Solo un administrador puede editar cuadrillas.")
-            if st.button("Guardar datos de la cuadrilla", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede editar cuadrillas.")
+            if st.button("Guardar datos de la cuadrilla", disabled=not es_gestor()):
                 actualizar_cuadrilla(sb, codigo_activo, nombre_ui, frentes_ui, uso_ui, activo_ui)
                 st.success("Datos actualizados.")
                 st.rerun()
@@ -3973,9 +4335,9 @@ with tab_precios:
                 "y guarda -- la tarifa/subtotal se completa sola despues de guardar."
             )
 
-            if not es_admin():
-                st.caption("Solo un administrador puede editar la composicion de una cuadrilla.")
-            if st.button("Guardar composicion", type="primary", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede editar la composicion de una cuadrilla.")
+            if st.button("Guardar composicion", type="primary", disabled=not es_gestor()):
                 guardar_composicion_cuadrilla(sb, codigo_activo, df_comp_editado)
                 st.success("Composicion actualizada -- el costo/dia se recalculo solo.")
                 st.rerun()
@@ -4015,9 +4377,9 @@ with tab_precios:
                 "'supervision' = SISO/Residente/Director, se carga aparte en PARAMETROS, "
                 "no en cuadrillas."
             )
-            if not es_admin():
-                st.caption("Solo un administrador puede crear cargos.")
-            if st.button("Crear cargo", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede crear cargos.")
+            if st.button("Crear cargo", disabled=not es_gestor()):
                 nombre_norm = cargo_nuevo_nombre.strip().upper()
                 existentes = {c["cargo"] for c in cargos_actuales}
                 if not nombre_norm:
@@ -4046,9 +4408,9 @@ with tab_precios:
             key="editor_cargos_personal",
         )
 
-        if not es_admin():
-            st.caption("Solo un administrador puede guardar cambios de tarifas.")
-        if st.button("Guardar tarifas nuevas", disabled=not es_admin()):
+        if not es_gestor():
+            st.caption("Solo un administrador o cotizador puede guardar cambios de tarifas.")
+        if st.button("Guardar tarifas nuevas", disabled=not es_gestor()):
             cambios_tarifa = 0
             originales_cargo = {c["cargo"]: c for c in cargos_actuales}
             for _, fila in df_cargos_editado.iterrows():
@@ -4097,10 +4459,10 @@ with tab_precios:
                 )
                 st.write(f"**{len(cambian)} APU(s) van a cambiar** de {len(df_impacto)} evaluados.")
 
-                if not es_admin():
-                    st.caption("Solo un administrador puede confirmar el recosteo.")
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede confirmar el recosteo.")
                 if len(cambian) and st.button(
-                    "Confirmar y guardar recosteo", type="primary", disabled=not es_admin()
+                    "Confirmar y guardar recosteo", type="primary", disabled=not es_gestor()
                 ):
                     n_aplicados = aplicar_recosteo_mano_obra(sb, impacto)
                     st.session_state.impacto_recosteo = None
@@ -4170,7 +4532,16 @@ with tab_editor_apu:
     with col_crear1:
         with st.expander("Crear un insumo nuevo"):
             st.caption("Para cuando el material que necesitas todavia no esta en el catalogo de insumos.")
-            nuevo_ins_codigo = st.text_input("Codigo (ej. MAT-2200)", key="nuevo_insumo_codigo")
+            nuevo_ins_prefijo = st.text_input(
+                "Prefijo del codigo (ej. MAT)", value="MAT", key="nuevo_insumo_prefijo",
+            ).strip().upper() or "MAT"
+            codigo_sugerido_ins = siguiente_codigo_insumo(sb, nuevo_ins_prefijo)
+            nuevo_ins_codigo = st.text_input(
+                "Codigo (autocompletado con el siguiente consecutivo -- se puede ajustar)",
+                value=codigo_sugerido_ins,
+                key=f"nuevo_insumo_codigo_{nuevo_ins_prefijo}",
+            )
+            st.caption(f"Siguiente consecutivo libre para '{nuevo_ins_prefijo}': {codigo_sugerido_ins}")
             nuevo_ins_desc = st.text_input("Descripcion", key="nuevo_insumo_desc")
             col_a, col_b = st.columns(2)
             with col_a:
@@ -4178,9 +4549,9 @@ with tab_editor_apu:
             with col_b:
                 nuevo_ins_precio = st.number_input("Precio", min_value=0.0, step=100.0, key="nuevo_insumo_precio")
             nuevo_ins_proveedor = st.text_input("Proveedor (opcional)", key="nuevo_insumo_proveedor")
-            if not es_admin():
-                st.caption("Solo un administrador puede crear insumos.")
-            if st.button("Crear insumo", key="btn_crear_insumo", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede crear insumos.")
+            if st.button("Crear insumo", key="btn_crear_insumo", disabled=not es_gestor()):
                 if not nuevo_ins_codigo or not nuevo_ins_desc or not nuevo_ins_unidad:
                     st.error("Codigo, descripcion y unidad son obligatorios.")
                 else:
@@ -4199,12 +4570,27 @@ with tab_editor_apu:
                 "Arranca vacio (queda marcado como 'candidato' hasta que le agregues "
                 "insumos y guardes la receta)."
             )
-            nuevo_apu_codigo = st.text_input("Codigo (ej. PIN-068)", key="nuevo_apu_codigo")
+            categorias_apu_nuevo = obtener_categorias_apu(sb)
+            nueva_apu_categoria = st.selectbox(
+                "Capitulo", categorias_apu_nuevo + ["(otro capitulo nuevo)"], key="nuevo_apu_categoria",
+            )
+            if nueva_apu_categoria == "(otro capitulo nuevo)":
+                nueva_apu_categoria = st.text_input(
+                    "Prefijo del capitulo nuevo (ej. XYZ)", key="nuevo_apu_categoria_custom",
+                ).strip().upper()
+            codigo_sugerido_apu = siguiente_codigo_apu(sb, nueva_apu_categoria) if nueva_apu_categoria else ""
+            nuevo_apu_codigo = st.text_input(
+                "Codigo (autocompletado con el siguiente consecutivo del capitulo -- se puede ajustar)",
+                value=codigo_sugerido_apu,
+                key=f"nuevo_apu_codigo_{nueva_apu_categoria}",
+            )
+            if nueva_apu_categoria:
+                st.caption(f"Siguiente consecutivo libre para '{nueva_apu_categoria}': {codigo_sugerido_apu}")
             nuevo_apu_desc = st.text_input("Descripcion", key="nuevo_apu_desc")
             nuevo_apu_unidad = st.text_input("Unidad (ej. m2, Un, Glb)", key="nuevo_apu_unidad")
-            if not es_admin():
-                st.caption("Solo un administrador puede crear APUs nuevos.")
-            if st.button("Crear APU", key="btn_crear_apu", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede crear APUs nuevos.")
+            if st.button("Crear APU", key="btn_crear_apu", disabled=not es_gestor()):
                 if not nuevo_apu_codigo or not nuevo_apu_desc or not nuevo_apu_unidad:
                     st.error("Codigo, descripcion y unidad son obligatorios.")
                 else:
@@ -4290,12 +4676,12 @@ with tab_editor_apu:
                     "/ rendimiento) -- igual que ASIGNAR_CUADRILLAS.txt / "
                     "CAMBIAR_CUADRILLA.txt del Excel maestro."
                 )
-                if not es_admin():
-                    st.caption("Solo un administrador puede reasignar la cuadrilla de un APU.")
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede reasignar la cuadrilla de un APU.")
                 if st.button(
                     "Guardar cuadrilla asignada",
                     key=f"guardar_cuadrilla_{apu_codigo_activo}",
-                    disabled=not es_admin(),
+                    disabled=not es_gestor(),
                 ):
                     asignar_cuadrilla_apu(sb, apu_codigo_activo, apu, cuadrilla_elegida_codigo)
                     st.success("Cuadrilla actualizada.")
@@ -4371,9 +4757,9 @@ with tab_editor_apu:
                         "Cantidad por unidad de APU", min_value=0.0001, step=0.0001, format="%.4f",
                         value=1.0, key="cantidad_insumo_nuevo",
                     )
-                    if not es_admin():
-                        st.caption("Solo un administrador puede agregar insumos a una receta.")
-                    if st.button("Agregar este insumo a la receta", disabled=not es_admin()):
+                    if not es_gestor():
+                        st.caption("Solo un administrador o cotizador puede agregar insumos a una receta.")
+                    if st.button("Agregar este insumo a la receta", disabled=not es_gestor()):
                         sb.table("apu_insumos").upsert(
                             {
                                 "apu_codigo": apu_codigo_activo,
@@ -4420,9 +4806,9 @@ with tab_editor_apu:
                     precio_fija = st.number_input(
                         "Precio unitario", min_value=0.0, step=100.0, key="precio_fija_nueva"
                     )
-                if not es_admin():
-                    st.caption("Solo un administrador puede agregar lineas fijas a una receta.")
-                if st.button("Agregar esta linea fija", disabled=not es_admin()):
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede agregar lineas fijas a una receta.")
+                if st.button("Agregar esta linea fija", disabled=not es_gestor()):
                     if not desc_fija:
                         st.error("La descripcion es obligatoria.")
                     else:
@@ -4456,9 +4842,9 @@ with tab_editor_apu:
             )
             st.caption("El total real se recalcula al guardar (por redondeo puede variar unos pesos).")
 
-            if not es_admin():
-                st.caption("Solo un administrador puede guardar cambios de la receta de un APU.")
-            if st.button("Guardar cambios de la receta", type="primary", disabled=not es_admin()):
+            if not es_gestor():
+                st.caption("Solo un administrador o cotizador puede guardar cambios de la receta de un APU.")
+            if st.button("Guardar cambios de la receta", type="primary", disabled=not es_gestor()):
                 guardar_receta_apu(
                     sb,
                     apu_codigo_activo,
