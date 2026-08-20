@@ -4873,6 +4873,31 @@ with tab_editor_apu:
             st.subheader(f"{apu['codigo']} · {apu['descripcion']}")
             st.caption(f"Unidad: {apu['unidad']} · Categoria: {apu['categoria']}")
 
+            with st.expander("Editar descripcion / unidad de este APU"):
+                col_nom1, col_nom2 = st.columns([2, 1])
+                with col_nom1:
+                    descripcion_ui = st.text_input(
+                        "Descripcion", value=apu["descripcion"], key=f"descripcion_editor_{apu_codigo_activo}",
+                    )
+                with col_nom2:
+                    unidad_ui = st.text_input(
+                        "Unidad", value=apu["unidad"], key=f"unidad_editor_{apu_codigo_activo}",
+                    )
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede renombrar un APU.")
+                if st.button(
+                    "Guardar descripcion / unidad", key=f"btn_guardar_nombre_{apu_codigo_activo}",
+                    disabled=not es_gestor(),
+                ):
+                    if not descripcion_ui.strip() or not unidad_ui.strip():
+                        st.error("Descripcion y unidad no pueden quedar vacias.")
+                    else:
+                        sb.table("catalogo_apu").update(
+                            {"descripcion": descripcion_ui.strip(), "unidad": unidad_ui.strip()}
+                        ).eq("codigo", apu_codigo_activo).execute()
+                        st.success("Descripcion/unidad actualizadas.")
+                        st.rerun()
+
             import pandas as pd
 
             st.markdown("**Cuadrilla asignada**")
