@@ -2837,19 +2837,38 @@ def _siguiente_numero_codigo(codigos_existentes, prefijo):
     return siguiente, ancho
 
 
+def _fetch_todos_los_codigos(query):
+    """Trae TODAS las filas de una consulta de Supabase paginando con
+    .range(), en vez de un solo .execute() -- Supabase/PostgREST limita
+    cada respuesta a 1000 filas por defecto, y con mas de 1000 codigos
+    para un mismo prefijo (ej. 'MAT-') un solo .execute() se queda corto
+    silenciosamente: no avisa que trunco nada, solo devuelve las primeras
+    1000 (en el orden que le de la gana al motor, no necesariamente por
+    numero). Eso hacia que el consecutivo sugerido pisara codigos que ya
+    existian mas alla de esa fila 1000. Paginando de a 1000 nos aseguramos
+    de ver el listado completo antes de calcular el siguiente numero."""
+    paso = 1000
+    codigos = []
+    inicio = 0
+    while True:
+        pagina = query.range(inicio, inicio + paso - 1).execute().data
+        if not pagina:
+            break
+        codigos.extend(f["codigo"] for f in pagina)
+        if len(pagina) < paso:
+            break
+        inicio += paso
+    return codigos
+
+
 def siguiente_codigo_insumo(sb, prefijo="MAT"):
     """Siguiente codigo libre para un insumo nuevo, ej. 'MAT-2201' si el
     ultimo insumo MAT- que existe es 'MAT-2200'. Evita que dos personas
     inventen el mismo codigo a mano y se sobreescriban sin darse cuenta."""
     prefijo = (prefijo or "MAT").strip().upper()
-    filas = (
-        sb.table("insumos")
-        .select("codigo")
-        .ilike("codigo", f"{prefijo}-%")
-        .execute()
-        .data
-    )
-    siguiente, ancho = _siguiente_numero_codigo([f["codigo"] for f in filas], prefijo)
+    query = sb.table("insumos").select("codigo").ilike("codigo", f"{prefijo}-%")
+    codigos = _fetch_todos_los_codigos(query)
+    siguiente, ancho = _siguiente_numero_codigo(codigos, prefijo)
     return f"{prefijo}-{siguiente:0{ancho}d}"
 
 
@@ -2859,14 +2878,9 @@ def siguiente_codigo_apu(sb, categoria):
     categoria = (categoria or "").strip().upper()
     if not categoria:
         return ""
-    filas = (
-        sb.table("catalogo_apu")
-        .select("codigo")
-        .eq("categoria", categoria)
-        .execute()
-        .data
-    )
-    siguiente, ancho = _siguiente_numero_codigo([f["codigo"] for f in filas], categoria)
+    query = sb.table("catalogo_apu").select("codigo").eq("categoria", categoria)
+    codigos = _fetch_todos_los_codigos(query)
+    siguiente, ancho = _siguiente_numero_codigo(codigos, categoria)
     return f"{categoria}-{siguiente:0{ancho}d}"
 
 
