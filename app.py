@@ -2949,6 +2949,104 @@ def crear_apu_nuevo(sb, codigo, descripcion, unidad):
     return codigo
 
 
+def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad_nueva=None):
+    """Crea un APU nuevo copiando la receta completa de uno que ya existe:
+    cuadrilla asignada, rendimiento, equipo, transporte, y todos los
+    insumos y lineas de materiales fijas. Sirve para partir de un APU
+    parecido y solo ajustarle un par de cosas (una cantidad, un insumo
+    distinto, etc.) en vez de armar todo desde cero. Deja registro en la
+    bitacora indicando de que APU se duplico."""
+    codigo_origen = codigo_origen.strip().upper()
+    codigo_nuevo = codigo_nuevo.strip().upper()
+
+    apu_original = obtener_apu_detalle(sb, codigo_origen)
+    if apu_original is None:
+        raise ValueError(f"El APU de origen {codigo_origen} no existe.")
+    if "-" not in codigo_nuevo:
+        raise ValueError("El codigo nuevo debe tener el formato CATEGORIA-NUMERO, ej. PIN-068.")
+    if sb.table("catalogo_apu").select("codigo").eq("codigo", codigo_nuevo).execute().data:
+        raise ValueError(f"Ya existe un APU con el codigo {codigo_nuevo}.")
+
+    # --- 1. fila principal: copia los valores de costo/receta general ---
+    registro = {
+        "codigo": codigo_nuevo,
+        "descripcion": (descripcion_nueva or apu_original["descripcion"]).strip(),
+        "unidad": (unidad_nueva or apu_original["unidad"]).strip(),
+        "equipo": float(apu_original.get("equipo") or 0),
+        "transporte": float(apu_original.get("transporte") or 0),
+        "mano_obra": float(apu_original.get("mano_obra") or 0),
+        "personal_supervision": float(apu_original.get("personal_supervision") or 0),
+        "rendimiento_dia": apu_original.get("rendimiento_dia"),
+        "cuadrilla_codigo": apu_original.get("cuadrilla_codigo"),
+        "es_candidato": bool(apu_original.get("es_candidato")),
+    }
+    sb.table("catalogo_apu").insert(registro).execute()
+
+    # --- 2. copiar insumos de la receta (apu_insumos) ---
+    insumos_origen = (
+        sb.table("apu_insumos")
+        .select("insumo_codigo, cantidad")
+        .eq("apu_codigo", codigo_origen)
+        .execute()
+        .data
+    )
+    if insumos_origen:
+        sb.table("apu_insumos").insert(
+            [
+                {"apu_codigo": codigo_nuevo, "insumo_codigo": f["insumo_codigo"], "cantidad": f["cantidad"]}
+                for f in insumos_origen
+            ]
+        ).execute()
+
+    # --- 3. copiar lineas de materiales fijas (apu_materiales_fijos) ---
+    fijos_origen = (
+        sb.table("apu_materiales_fijos")
+        .select("descripcion, unidad, cantidad, precio_unitario")
+        .eq("apu_codigo", codigo_origen)
+        .execute()
+        .data
+    )
+    if fijos_origen:
+        sb.table("apu_materiales_fijos").insert(
+            [
+                {
+                    "apu_codigo": codigo_nuevo,
+                    "descripcion": f["descripcion"],
+                    "unidad": f["unidad"],
+                    "cantidad": f["cantidad"],
+                    "precio_unitario": f["precio_unitario"],
+                }
+                for f in fijos_origen
+            ]
+        ).execute()
+
+    # --- 4. recalcular materiales del nuevo APU desde la vista (insumos + fijos ya copiados) ---
+    if insumos_origen or fijos_origen:
+        calculado = (
+            sb.table("v_apu_materiales_calculado")
+            .select("materiales_calculado")
+            .eq("apu_codigo", codigo_nuevo)
+            .execute()
+            .data
+        )
+        materiales_nuevo = round(float(calculado[0]["materiales_calculado"]), 0) if calculado else 0.0
+        sb.table("catalogo_apu").update({"materiales": materiales_nuevo}).eq("codigo", codigo_nuevo).execute()
+
+    # --- 5. bitacora: queda registrado de que APU se duplico ---
+    sb.table("bitacora_precios").insert(
+        {
+            "apu_codigo": codigo_nuevo,
+            "campo": f"creacion (duplicado de {codigo_origen})",
+            "valor_anterior": 0,
+            "valor_nuevo": float(apu_original.get("total") or 0),
+            "origen": "CREACION",
+            "usuario": _usuario_bitacora(),
+        }
+    ).execute()
+
+    return codigo_nuevo
+
+
 def _registrar_cambio_apu(sb, apu_codigo, campo, viejo, nuevo, origen="MANUAL"):
     if viejo is None:
         viejo = 0
@@ -4593,7 +4691,7 @@ with tab_editor_apu:
         "solo si el APU ya tiene una cuadrilla asignada -- si no, se edita directamente."
     )
 
-    col_crear1, col_crear2 = st.columns(2)
+    col_crear1, col_crear2, col_crear3 = st.columns(3)
     with col_crear1:
         with st.expander("Crear un insumo nuevo"):
             st.caption("Para cuando el material que necesitas todavia no esta en el catalogo de insumos.")
@@ -4666,6 +4764,69 @@ with tab_editor_apu:
                         st.rerun()
                     except Exception as e:
                         st.error(str(e))
+
+    with col_crear3:
+        with st.expander("Duplicar un APU existente"):
+            st.caption(
+                "Copia la cuadrilla, rendimiento, equipo, transporte y todos los "
+                "insumos/lineas fijas de un APU que ya existe a uno nuevo -- para "
+                "partir de uno parecido y solo ajustarle un par de cosas."
+            )
+            categorias_dup = obtener_categorias_apu(sb)
+            col_dup_cat, col_dup_txt = st.columns(2)
+            with col_dup_cat:
+                categoria_dup = st.selectbox(
+                    "Capitulo (opcional)", ["(todos)"] + categorias_dup, key="dup_apu_categoria"
+                )
+            with col_dup_txt:
+                busq_dup = st.text_input("Buscar por codigo o descripcion", key="dup_apu_busqueda")
+            resultados_dup = buscar_apus(
+                sb, texto=busq_dup or None,
+                categoria=None if categoria_dup == "(todos)" else categoria_dup,
+            )
+            if not resultados_dup:
+                st.info("No encontre APUs con esos filtros.")
+            else:
+                opciones_dup = {
+                    f"{a['codigo']} · {a['descripcion'][:70]} ({a['unidad']})": a["codigo"]
+                    for a in resultados_dup
+                }
+                elegido_dup_etiqueta = st.selectbox(
+                    "APU de origen (el que quieres copiar)", list(opciones_dup.keys()), key="dup_apu_origen_select",
+                )
+                codigo_origen_dup = opciones_dup[elegido_dup_etiqueta]
+                apu_origen_dup = obtener_apu_detalle(sb, codigo_origen_dup)
+                codigo_sugerido_dup = siguiente_codigo_apu(sb, apu_origen_dup["categoria"])
+                nuevo_codigo_dup = st.text_input(
+                    "Codigo del APU nuevo (autocompletado con el siguiente consecutivo -- se puede ajustar)",
+                    value=codigo_sugerido_dup,
+                    key=f"dup_apu_codigo_{codigo_origen_dup}",
+                )
+                st.caption(f"Siguiente consecutivo libre para '{apu_origen_dup['categoria']}': {codigo_sugerido_dup}")
+                nueva_desc_dup = st.text_input(
+                    "Descripcion del APU nuevo", value=apu_origen_dup["descripcion"], key=f"dup_apu_desc_{codigo_origen_dup}",
+                )
+                nueva_unidad_dup = st.text_input(
+                    "Unidad del APU nuevo", value=apu_origen_dup["unidad"], key=f"dup_apu_unidad_{codigo_origen_dup}",
+                )
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede duplicar un APU.")
+                if st.button("Duplicar APU", key="btn_duplicar_apu", disabled=not es_gestor()):
+                    if not nuevo_codigo_dup or not nueva_desc_dup or not nueva_unidad_dup:
+                        st.error("Codigo, descripcion y unidad son obligatorios.")
+                    else:
+                        try:
+                            codigo_creado_dup = duplicar_apu(
+                                sb, codigo_origen_dup, nuevo_codigo_dup, nueva_desc_dup, nueva_unidad_dup,
+                            )
+                            st.session_state.editor_apu_codigo = codigo_creado_dup
+                            st.success(
+                                f"APU {codigo_creado_dup} creado a partir de {codigo_origen_dup}, con su misma "
+                                "cuadrilla, rendimiento, equipo, transporte e insumos. Ya lo puedes ajustar abajo."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
 
     st.divider()
     st.caption(
