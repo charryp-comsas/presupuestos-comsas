@@ -4900,76 +4900,18 @@ with tab_editor_apu:
 
             import pandas as pd
 
-            st.markdown("**Cuadrilla asignada**")
-            cuadrillas_lista = obtener_cuadrillas(sb)
-            opciones_cuad_apu = {"(sin cuadrilla -- mano de obra manual)": None}
-            opciones_cuad_apu.update(
-                {f"{c['codigo']} · {c['nombre']} ({money(c['costo_dia'])}/dia)": c["codigo"] for c in cuadrillas_lista}
+            st.markdown("---")
+            st.markdown("### I. EQUIPO")
+            equipo_ui = st.number_input(
+                "Valor equipo ($, por unidad de este APU)", min_value=0.0, step=100.0,
+                value=float(apu.get("equipo") or 0), key="equipo_editor",
             )
-            etiquetas_cuad_apu = list(opciones_cuad_apu.keys())
-            actual_codigo = apu.get("cuadrilla_codigo")
-            indice_actual = 0
-            for i, (etiqueta, codigo) in enumerate(opciones_cuad_apu.items()):
-                if codigo == actual_codigo:
-                    indice_actual = i
-                    break
-            cuadrilla_elegida_etiqueta = st.selectbox(
-                "Cuadrilla",
-                etiquetas_cuad_apu,
-                index=indice_actual,
-                key=f"select_cuadrilla_apu_{apu_codigo_activo}",
+
+            st.markdown("### II. MATERIALES")
+            st.caption(
+                "Los insumos que componen esta actividad (equivalente a la seccion "
+                "'II. MATERIALES' del APU en Excel)."
             )
-            cuadrilla_elegida_codigo = opciones_cuad_apu[cuadrilla_elegida_etiqueta]
-            if cuadrilla_elegida_codigo != actual_codigo:
-                st.caption(
-                    "Cambio sin guardar todavia. Si el APU ya tiene rendimiento/dia, la "
-                    "mano de obra se recalcula sola al guardar (costo/dia de la cuadrilla "
-                    "/ rendimiento) -- igual que ASIGNAR_CUADRILLAS.txt / "
-                    "CAMBIAR_CUADRILLA.txt del Excel maestro."
-                )
-                if not es_gestor():
-                    st.caption("Solo un administrador o cotizador puede reasignar la cuadrilla de un APU.")
-                if st.button(
-                    "Guardar cuadrilla asignada",
-                    key=f"guardar_cuadrilla_{apu_codigo_activo}",
-                    disabled=not es_gestor(),
-                ):
-                    asignar_cuadrilla_apu(sb, apu_codigo_activo, apu, cuadrilla_elegida_codigo)
-                    st.success("Cuadrilla actualizada.")
-                    st.rerun()
-            elif actual_codigo:
-                st.caption(
-                    "La mano de obra se recalcula sola a partir del rendimiento "
-                    "(no se edita directo mientras tenga cuadrilla asignada)."
-                )
-
-            col_e1, col_e2, col_e3 = st.columns(3)
-            with col_e1:
-                equipo_ui = st.number_input(
-                    "Equipo ($)", min_value=0.0, step=100.0, value=float(apu.get("equipo") or 0),
-                    key="equipo_editor",
-                )
-            with col_e2:
-                transporte_ui = st.number_input(
-                    "Transporte ($)", min_value=0.0, step=100.0, value=float(apu.get("transporte") or 0),
-                    key="transporte_editor",
-                )
-            with col_e3:
-                rendimiento_ui = st.number_input(
-                    "Rendimiento (unidades/dia)", min_value=0.0, step=0.01, format="%.4f",
-                    value=float(apu.get("rendimiento_dia") or 0), key="rendimiento_editor",
-                )
-
-            if apu.get("cuadrilla_codigo"):
-                st.caption(f"Mano de obra actual (calculada): {money(apu.get('mano_obra'))}")
-                mano_obra_ui = float(apu.get("mano_obra") or 0)
-            else:
-                mano_obra_ui = st.number_input(
-                    "Mano de obra ($, sin cuadrilla asignada -- se edita a mano)",
-                    min_value=0.0, step=100.0, value=float(apu.get("mano_obra") or 0),
-                    key="mano_obra_editor",
-                )
-
             st.markdown("**Insumos de la receta**")
             insumos_apu = obtener_insumos_de_apu(sb, apu_codigo_activo)
             df_insumos_editor = None
@@ -5075,7 +5017,72 @@ with tab_editor_apu:
                         st.success("Linea agregada.")
                         st.rerun()
 
-            st.divider()
+            st.markdown("---")
+            st.markdown("### III. MANO DE OBRA")
+            cuadrillas_lista = obtener_cuadrillas(sb)
+            opciones_cuad_apu = {"(sin cuadrilla -- mano de obra manual)": None}
+            opciones_cuad_apu.update(
+                {f"{c['codigo']} · {c['nombre']} ({money(c['costo_dia'])}/dia)": c["codigo"] for c in cuadrillas_lista}
+            )
+            etiquetas_cuad_apu = list(opciones_cuad_apu.keys())
+            actual_codigo = apu.get("cuadrilla_codigo")
+            indice_actual = 0
+            for i, (etiqueta, codigo) in enumerate(opciones_cuad_apu.items()):
+                if codigo == actual_codigo:
+                    indice_actual = i
+                    break
+            cuadrilla_elegida_etiqueta = st.selectbox(
+                "Cuadrilla (equivalente a la hoja CUADRILLAS del Excel)",
+                etiquetas_cuad_apu,
+                index=indice_actual,
+                key=f"select_cuadrilla_apu_{apu_codigo_activo}",
+            )
+            cuadrilla_elegida_codigo = opciones_cuad_apu[cuadrilla_elegida_etiqueta]
+            if cuadrilla_elegida_codigo != actual_codigo:
+                st.caption(
+                    "Cambio sin guardar todavia. Si el APU ya tiene rendimiento/dia, la "
+                    "mano de obra se recalcula sola al guardar (costo/dia de la cuadrilla "
+                    "/ rendimiento) -- igual que ASIGNAR_CUADRILLAS.txt / "
+                    "CAMBIAR_CUADRILLA.txt del Excel maestro."
+                )
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede reasignar la cuadrilla de un APU.")
+                if st.button(
+                    "Guardar cuadrilla asignada",
+                    key=f"guardar_cuadrilla_{apu_codigo_activo}",
+                    disabled=not es_gestor(),
+                ):
+                    asignar_cuadrilla_apu(sb, apu_codigo_activo, apu, cuadrilla_elegida_codigo)
+                    st.success("Cuadrilla actualizada.")
+                    st.rerun()
+            elif actual_codigo:
+                st.caption(
+                    "La mano de obra se recalcula sola a partir del rendimiento "
+                    "(no se edita directo mientras tenga cuadrilla asignada)."
+                )
+
+            rendimiento_ui = st.number_input(
+                "Rendimiento (unidades/dia que hace esa cuadrilla)", min_value=0.0, step=0.01, format="%.4f",
+                value=float(apu.get("rendimiento_dia") or 0), key="rendimiento_editor",
+            )
+
+            if apu.get("cuadrilla_codigo"):
+                st.caption(f"Mano de obra actual (calculada = costo/dia de la cuadrilla ÷ rendimiento): {money(apu.get('mano_obra'))}")
+                mano_obra_ui = float(apu.get("mano_obra") or 0)
+            else:
+                mano_obra_ui = st.number_input(
+                    "Mano de obra ($, sin cuadrilla asignada -- se edita a mano)",
+                    min_value=0.0, step=100.0, value=float(apu.get("mano_obra") or 0),
+                    key="mano_obra_editor",
+                )
+
+            st.markdown("### IV. TRANSPORTE")
+            transporte_ui = st.number_input(
+                "Valor transporte ($, por unidad de este APU)", min_value=0.0, step=100.0,
+                value=float(apu.get("transporte") or 0), key="transporte_editor",
+            )
+
+            st.markdown("---")
             materiales_preview = 0.0
             if df_insumos_editor is not None:
                 materiales_preview += float(
