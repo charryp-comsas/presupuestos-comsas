@@ -2798,6 +2798,40 @@ def obtener_fijos_de_apu(sb, codigo):
     return filas
 
 
+def obtener_equipo_de_apu(sb, codigo):
+    """Lineas de equipo/herramienta del APU (seccion 'I. EQUIPO Y
+    HERRAMIENTAS' del Excel) -- mismo patron que obtener_fijos_de_apu."""
+    filas = (
+        sb.table("apu_equipo_items")
+        .select("id, descripcion, unidad, cantidad, precio_unitario")
+        .eq("apu_codigo", codigo)
+        .order("id")
+        .execute()
+        .data
+    )
+    for f in filas:
+        f["subtotal"] = round(float(f["cantidad"] or 0) * float(f["precio_unitario"] or 0), 2)
+        f["eliminar"] = False
+    return filas
+
+
+def obtener_transporte_de_apu(sb, codigo):
+    """Lineas de transporte del APU (seccion 'III. TRANSPORTES' del
+    Excel) -- mismo patron que obtener_fijos_de_apu."""
+    filas = (
+        sb.table("apu_transporte_items")
+        .select("id, descripcion, unidad, cantidad, precio_unitario")
+        .eq("apu_codigo", codigo)
+        .order("id")
+        .execute()
+        .data
+    )
+    for f in filas:
+        f["subtotal"] = round(float(f["cantidad"] or 0) * float(f["precio_unitario"] or 0), 2)
+        f["eliminar"] = False
+    return filas
+
+
 def buscar_insumos_catalogo(sb, texto, limite=20):
     if not texto:
         return []
@@ -3020,6 +3054,32 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
             ]
         ).execute()
 
+    # --- 3b. copiar lineas de equipo (apu_equipo_items) ---
+    equipo_origen = (
+        sb.table("apu_equipo_items")
+        .select("descripcion, unidad, cantidad, precio_unitario")
+        .eq("apu_codigo", codigo_origen)
+        .execute()
+        .data
+    )
+    if equipo_origen:
+        sb.table("apu_equipo_items").insert(
+            [{"apu_codigo": codigo_nuevo, **f} for f in equipo_origen]
+        ).execute()
+
+    # --- 3c. copiar lineas de transporte (apu_transporte_items) ---
+    transporte_origen = (
+        sb.table("apu_transporte_items")
+        .select("descripcion, unidad, cantidad, precio_unitario")
+        .eq("apu_codigo", codigo_origen)
+        .execute()
+        .data
+    )
+    if transporte_origen:
+        sb.table("apu_transporte_items").insert(
+            [{"apu_codigo": codigo_nuevo, **f} for f in transporte_origen]
+        ).execute()
+
     # --- 4. recalcular materiales del nuevo APU desde la vista (insumos + fijos ya copiados) ---
     if insumos_origen or fijos_origen:
         calculado = (
@@ -3066,12 +3126,41 @@ def _registrar_cambio_apu(sb, apu_codigo, campo, viejo, nuevo, origen="MANUAL"):
     ).execute()
 
 
-def guardar_receta_apu(sb, apu_codigo, apu_original, df_insumos, df_fijos, equipo, transporte, rendimiento_dia, mano_obra_manual):
-    """Aplica los cambios de la receta de un APU: sincroniza apu_insumos
-    y apu_materiales_fijos con lo editado en pantalla, actualiza
-    equipo/transporte/rendimiento_dia (y mano_obra si no tiene cuadrilla
-    asignada), recalcula materiales desde v_apu_materiales_calculado, y
-    deja todo registrado en la bitacora."""
+def _sincronizar_items_por_lineas(sb, tabla, apu_codigo, df, valor_manual_respaldo):
+    """Aplica a una tabla de lineas (apu_equipo_items o
+    apu_transporte_items -- misma forma que apu_materiales_fijos) los
+    cambios editados en pantalla: borra las marcadas, actualiza cantidad/
+    precio de las demas. Devuelve el subtotal: si quedan lineas, es la
+    suma de cantidad*precio_unitario de todas; si no quedan lineas (o
+    nunca se detallo por lineas), devuelve el valor manual de respaldo
+    (para no perder el numero que ya tenia el APU antes de este cambio)."""
+    for _, fila in df.iterrows():
+        if fila.get("eliminar"):
+            sb.table(tabla).delete().eq("id", int(fila["id"])).execute()
+        else:
+            sb.table(tabla).update(
+                {"cantidad": float(fila["cantidad"]), "precio_unitario": float(fila["precio_unitario"])}
+            ).eq("id", int(fila["id"])).execute()
+
+    restantes = sb.table(tabla).select("cantidad, precio_unitario").eq("apu_codigo", apu_codigo).execute().data
+    if restantes:
+        return round(sum(float(r["cantidad"] or 0) * float(r["precio_unitario"] or 0) for r in restantes), 0)
+    return float(valor_manual_respaldo or 0)
+
+
+def guardar_receta_apu(
+    sb, apu_codigo, apu_original, df_insumos, df_fijos, df_equipo, df_transporte,
+    equipo_manual, transporte_manual, rendimiento_dia, mano_obra_manual,
+):
+    """Aplica los cambios de la receta de un APU: sincroniza apu_insumos,
+    apu_materiales_fijos, apu_equipo_items y apu_transporte_items con lo
+    editado en pantalla, actualiza equipo/transporte/rendimiento_dia (y
+    mano_obra si no tiene cuadrilla asignada), recalcula materiales desde
+    v_apu_materiales_calculado, y deja todo registrado en la bitacora.
+    Equipo y transporte se calculan por lineas (igual que materiales) si
+    el APU ya tiene alguna linea cargada; si no tiene ninguna, se usa el
+    valor manual (compatibilidad con los APU antiguos que solo traen un
+    numero suelto de equipo/transporte, sin desglose)."""
     # --- insumos: eliminar marcados, actualizar cantidad cambiada ---
     for _, fila in df_insumos.iterrows():
         if fila.get("eliminar"):
@@ -3106,6 +3195,12 @@ def guardar_receta_apu(sb, apu_codigo, apu_original, df_insumos, df_fijos, equip
     materiales_nuevo = round(float(calculado[0]["materiales_calculado"]), 0) if calculado else 0.0
     _registrar_cambio_apu(sb, apu_codigo, "materiales", apu_original.get("materiales"), materiales_nuevo)
 
+    # --- equipo y transporte: por lineas si las tiene, si no el valor manual ---
+    equipo_nuevo = _sincronizar_items_por_lineas(sb, "apu_equipo_items", apu_codigo, df_equipo, equipo_manual)
+    transporte_nuevo = _sincronizar_items_por_lineas(
+        sb, "apu_transporte_items", apu_codigo, df_transporte, transporte_manual
+    )
+
     # --- mano de obra: si tiene cuadrilla, se recalcula sola; si no, se edita a mano ---
     cuadrilla_codigo = apu_original.get("cuadrilla_codigo")
     if cuadrilla_codigo and rendimiento_dia:
@@ -3115,20 +3210,20 @@ def guardar_receta_apu(sb, apu_codigo, apu_original, df_insumos, df_fijos, equip
         mano_obra_nuevo = float(mano_obra_manual)
     _registrar_cambio_apu(sb, apu_codigo, "mano_obra", apu_original.get("mano_obra"), mano_obra_nuevo)
 
-    _registrar_cambio_apu(sb, apu_codigo, "equipo", apu_original.get("equipo"), equipo)
-    _registrar_cambio_apu(sb, apu_codigo, "transporte", apu_original.get("transporte"), transporte)
+    _registrar_cambio_apu(sb, apu_codigo, "equipo", apu_original.get("equipo"), equipo_nuevo)
+    _registrar_cambio_apu(sb, apu_codigo, "transporte", apu_original.get("transporte"), transporte_nuevo)
     _registrar_cambio_apu(
         sb, apu_codigo, "rendimiento_dia", apu_original.get("rendimiento_dia"), rendimiento_dia
     )
 
     # --- si ya quedo con algun costo real, deja de ser "candidato" (incompleto) ---
     personal_supervision = float(apu_original.get("personal_supervision") or 0)
-    total_nuevo = materiales_nuevo + mano_obra_nuevo + float(equipo) + float(transporte) + personal_supervision
+    total_nuevo = materiales_nuevo + mano_obra_nuevo + equipo_nuevo + transporte_nuevo + personal_supervision
     actualizacion = {
         "materiales": materiales_nuevo,
         "mano_obra": mano_obra_nuevo,
-        "equipo": float(equipo),
-        "transporte": float(transporte),
+        "equipo": equipo_nuevo,
+        "transporte": transporte_nuevo,
         "rendimiento_dia": float(rendimiento_dia) if rendimiento_dia else None,
     }
     if total_nuevo > 0 and apu_original.get("es_candidato"):
@@ -4901,11 +4996,71 @@ with tab_editor_apu:
             import pandas as pd
 
             st.markdown("---")
-            st.markdown("### I. EQUIPO")
-            equipo_ui = st.number_input(
-                "Valor equipo ($, por unidad de este APU)", min_value=0.0, step=100.0,
-                value=float(apu.get("equipo") or 0), key="equipo_editor",
-            )
+            st.markdown("### I. EQUIPO Y HERRAMIENTAS")
+            equipo_items = obtener_equipo_de_apu(sb, apu_codigo_activo)
+            df_equipo_editor = None
+            if equipo_items:
+                df_equipo_base = pd.DataFrame(equipo_items)
+                df_equipo_editor = st.data_editor(
+                    df_equipo_base,
+                    column_config={
+                        "id": None,
+                        "descripcion": st.column_config.TextColumn("Descripcion"),
+                        "unidad": st.column_config.TextColumn("Unidad"),
+                        "cantidad": st.column_config.NumberColumn("Cant/Rend", min_value=0.0, step=0.0001, format="%.4f"),
+                        "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$ %d"),
+                        "subtotal": st.column_config.NumberColumn("VR parcial", format="$ %d", disabled=True),
+                        "eliminar": st.column_config.CheckboxColumn("Eliminar"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                    key=f"editor_equipo_{apu_codigo_activo}",
+                )
+            else:
+                st.caption("Esta receta no tiene equipo desglosado por lineas todavia.")
+
+            with st.expander("Agregar una linea de equipo/herramienta"):
+                desc_equipo = st.text_input("Descripcion", key="desc_equipo_nueva")
+                col_q1, col_q2, col_q3 = st.columns(3)
+                with col_q1:
+                    unidad_equipo = st.text_input("Unidad", key="unidad_equipo_nueva")
+                with col_q2:
+                    cantidad_equipo = st.number_input(
+                        "Cantidad/Rendimiento", min_value=0.0, step=0.0001, format="%.4f", key="cantidad_equipo_nueva"
+                    )
+                with col_q3:
+                    precio_equipo = st.number_input(
+                        "Precio unitario", min_value=0.0, step=100.0, key="precio_equipo_nueva"
+                    )
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede agregar lineas de equipo.")
+                if st.button("Agregar esta linea de equipo", key="btn_agregar_equipo", disabled=not es_gestor()):
+                    if not desc_equipo:
+                        st.error("La descripcion es obligatoria.")
+                    else:
+                        sb.table("apu_equipo_items").insert(
+                            {
+                                "apu_codigo": apu_codigo_activo,
+                                "descripcion": desc_equipo,
+                                "unidad": unidad_equipo,
+                                "cantidad": float(cantidad_equipo),
+                                "precio_unitario": float(precio_equipo),
+                            }
+                        ).execute()
+                        st.success("Linea de equipo agregada.")
+                        st.rerun()
+
+            if not equipo_items:
+                equipo_manual_ui = st.number_input(
+                    "Valor equipo total ($, mientras no lo detalles por lineas)",
+                    min_value=0.0, step=100.0, value=float(apu.get("equipo") or 0), key="equipo_editor",
+                )
+            else:
+                equipo_manual_ui = float(apu.get("equipo") or 0)
+                subtotal_equipo_actual = round(
+                    sum(float(f["cantidad"] or 0) * float(f["precio_unitario"] or 0) for f in equipo_items), 0
+                )
+                st.caption(f"Subtotal equipo = {money(subtotal_equipo_actual)}")
 
             st.markdown("### II. MATERIALES")
             st.caption(
@@ -5018,7 +5173,74 @@ with tab_editor_apu:
                         st.rerun()
 
             st.markdown("---")
-            st.markdown("### III. MANO DE OBRA")
+            st.markdown("### III. TRANSPORTES")
+            transporte_items = obtener_transporte_de_apu(sb, apu_codigo_activo)
+            df_transporte_editor = None
+            if transporte_items:
+                df_transporte_base = pd.DataFrame(transporte_items)
+                df_transporte_editor = st.data_editor(
+                    df_transporte_base,
+                    column_config={
+                        "id": None,
+                        "descripcion": st.column_config.TextColumn("Descripcion"),
+                        "unidad": st.column_config.TextColumn("Unidad"),
+                        "cantidad": st.column_config.NumberColumn("Cant/Rend", min_value=0.0, step=0.0001, format="%.4f"),
+                        "precio_unitario": st.column_config.NumberColumn("Precio unitario", format="$ %d"),
+                        "subtotal": st.column_config.NumberColumn("VR parcial", format="$ %d", disabled=True),
+                        "eliminar": st.column_config.CheckboxColumn("Eliminar"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                    key=f"editor_transporte_{apu_codigo_activo}",
+                )
+            else:
+                st.caption("Esta receta no tiene transporte desglosado por lineas todavia.")
+
+            with st.expander("Agregar una linea de transporte"):
+                desc_transp = st.text_input("Descripcion", key="desc_transporte_nueva")
+                col_t1, col_t2, col_t3 = st.columns(3)
+                with col_t1:
+                    unidad_transp = st.text_input("Unidad", key="unidad_transporte_nueva")
+                with col_t2:
+                    cantidad_transp = st.number_input(
+                        "Cantidad/Rendimiento", min_value=0.0, step=0.0001, format="%.4f", key="cantidad_transporte_nueva"
+                    )
+                with col_t3:
+                    precio_transp = st.number_input(
+                        "Precio unitario", min_value=0.0, step=100.0, key="precio_transporte_nueva"
+                    )
+                if not es_gestor():
+                    st.caption("Solo un administrador o cotizador puede agregar lineas de transporte.")
+                if st.button("Agregar esta linea de transporte", key="btn_agregar_transporte", disabled=not es_gestor()):
+                    if not desc_transp:
+                        st.error("La descripcion es obligatoria.")
+                    else:
+                        sb.table("apu_transporte_items").insert(
+                            {
+                                "apu_codigo": apu_codigo_activo,
+                                "descripcion": desc_transp,
+                                "unidad": unidad_transp,
+                                "cantidad": float(cantidad_transp),
+                                "precio_unitario": float(precio_transp),
+                            }
+                        ).execute()
+                        st.success("Linea de transporte agregada.")
+                        st.rerun()
+
+            if not transporte_items:
+                transporte_manual_ui = st.number_input(
+                    "Valor transporte total ($, mientras no lo detalles por lineas)",
+                    min_value=0.0, step=100.0, value=float(apu.get("transporte") or 0), key="transporte_editor",
+                )
+            else:
+                transporte_manual_ui = float(apu.get("transporte") or 0)
+                subtotal_transporte_actual = round(
+                    sum(float(f["cantidad"] or 0) * float(f["precio_unitario"] or 0) for f in transporte_items), 0
+                )
+                st.caption(f"Subtotal transporte = {money(subtotal_transporte_actual)}")
+
+            st.markdown("---")
+            st.markdown("### IV. MANO DE OBRA")
             cuadrillas_lista = obtener_cuadrillas(sb)
             opciones_cuad_apu = {"(sin cuadrilla -- mano de obra manual)": None}
             opciones_cuad_apu.update(
@@ -5076,27 +5298,23 @@ with tab_editor_apu:
                     key="mano_obra_editor",
                 )
 
-            st.markdown("### IV. TRANSPORTE")
-            transporte_ui = st.number_input(
-                "Valor transporte ($, por unidad de este APU)", min_value=0.0, step=100.0,
-                value=float(apu.get("transporte") or 0), key="transporte_editor",
-            )
-
             st.markdown("---")
-            materiales_preview = 0.0
-            if df_insumos_editor is not None:
-                materiales_preview += float(
-                    (df_insumos_editor.loc[~df_insumos_editor["eliminar"], "cantidad"]
-                     * df_insumos_editor.loc[~df_insumos_editor["eliminar"], "precio"]).sum()
-                )
-            if df_fijos_editor is not None:
-                materiales_preview += float(
-                    (df_fijos_editor.loc[~df_fijos_editor["eliminar"], "cantidad"]
-                     * df_fijos_editor.loc[~df_fijos_editor["eliminar"], "precio_unitario"]).sum()
-                )
-            total_preview = equipo_ui + materiales_preview + transporte_ui + mano_obra_ui + float(apu.get("personal_supervision") or 0)
+
+            def _subtotal_editable(df, col_precio):
+                if df is None:
+                    return 0.0
+                restante = df.loc[~df["eliminar"]]
+                return float((restante["cantidad"] * restante[col_precio]).sum())
+
+            equipo_preview = _subtotal_editable(df_equipo_editor, "precio_unitario") if df_equipo_editor is not None else equipo_manual_ui
+            transporte_preview = (
+                _subtotal_editable(df_transporte_editor, "precio_unitario") if df_transporte_editor is not None else transporte_manual_ui
+            )
+            materiales_preview = _subtotal_editable(df_insumos_editor, "precio") + _subtotal_editable(df_fijos_editor, "precio_unitario")
+            total_preview = equipo_preview + materiales_preview + transporte_preview + mano_obra_ui + float(apu.get("personal_supervision") or 0)
             st.write(
-                f"**Vista previa -- Materiales: {money(materiales_preview)} · Total APU: {money(total_preview)}**"
+                f"**Vista previa -- Equipo: {money(equipo_preview)} · Materiales: {money(materiales_preview)} · "
+                f"Transporte: {money(transporte_preview)} · Total APU: {money(total_preview)}**"
             )
             st.caption("El total real se recalcula al guardar (por redondeo puede variar unos pesos).")
 
@@ -5109,8 +5327,10 @@ with tab_editor_apu:
                     apu,
                     df_insumos_editor if df_insumos_editor is not None else pd.DataFrame(columns=["insumo_codigo", "cantidad", "eliminar"]),
                     df_fijos_editor if df_fijos_editor is not None else pd.DataFrame(columns=["id", "cantidad", "precio_unitario", "eliminar"]),
-                    equipo_ui,
-                    transporte_ui,
+                    df_equipo_editor if df_equipo_editor is not None else pd.DataFrame(columns=["id", "cantidad", "precio_unitario", "eliminar"]),
+                    df_transporte_editor if df_transporte_editor is not None else pd.DataFrame(columns=["id", "cantidad", "precio_unitario", "eliminar"]),
+                    equipo_manual_ui,
+                    transporte_manual_ui,
                     rendimiento_ui,
                     mano_obra_ui,
                 )
