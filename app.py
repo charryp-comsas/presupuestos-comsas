@@ -2141,14 +2141,13 @@ def calcular_vigencia(fecha_cotizacion, origen_precio):
 def obtener_insumos_para_semaforo(sb):
     """El semaforo de vigencia vive a nivel de INSUMO (hoja MATERIALES del
     Excel) -- catalogo_apu.materiales es solo el agregado por APU."""
-    filas = (
+    query = (
         sb.table("insumos")
         .select("codigo, descripcion, unidad, precio, proveedor, fecha_cotizacion, origen_precio, activo")
         .eq("activo", True)
         .order("codigo")
-        .execute()
-        .data
     )
+    filas = _fetch_todas_las_filas(query)
     for f in filas:
         f["vigencia"] = calcular_vigencia(f.get("fecha_cotizacion"), f.get("origen_precio"))
     return filas
@@ -2837,28 +2836,37 @@ def _siguiente_numero_codigo(codigos_existentes, prefijo):
     return siguiente, ancho
 
 
-def _fetch_todos_los_codigos(query):
+def _fetch_todas_las_filas(query):
     """Trae TODAS las filas de una consulta de Supabase paginando con
     .range(), en vez de un solo .execute() -- Supabase/PostgREST limita
-    cada respuesta a 1000 filas por defecto, y con mas de 1000 codigos
-    para un mismo prefijo (ej. 'MAT-') un solo .execute() se queda corto
-    silenciosamente: no avisa que trunco nada, solo devuelve las primeras
-    1000 (en el orden que le de la gana al motor, no necesariamente por
-    numero). Eso hacia que el consecutivo sugerido pisara codigos que ya
-    existian mas alla de esa fila 1000. Paginando de a 1000 nos aseguramos
-    de ver el listado completo antes de calcular el siguiente numero."""
+    cada respuesta a 1000 filas por defecto, y con mas de 1000 filas para
+    una misma tabla/prefijo (ej. mas de 1000 insumos 'MAT-') un solo
+    .execute() se queda corto silenciosamente: no avisa que trunco nada,
+    solo devuelve las primeras 1000 (en el orden que le de la gana al
+    motor si no se pidio order(), o por el order() pedido si lo hay).
+    Esto hacia que el consecutivo sugerido pisara codigos que ya existian
+    mas alla de esa fila 1000, y que listados como el Semaforo de
+    vigencia mostraran solo una porcion del catalogo real. Paginando de a
+    1000 nos aseguramos de ver el listado completo."""
     paso = 1000
-    codigos = []
+    filas = []
     inicio = 0
     while True:
         pagina = query.range(inicio, inicio + paso - 1).execute().data
         if not pagina:
             break
-        codigos.extend(f["codigo"] for f in pagina)
+        filas.extend(pagina)
         if len(pagina) < paso:
             break
         inicio += paso
-    return codigos
+    return filas
+
+
+def _fetch_todos_los_codigos(query):
+    """Igual que _fetch_todas_las_filas pero devuelve solo el campo
+    'codigo' de cada fila (para las funciones de siguiente-consecutivo,
+    que solo necesitan los codigos)."""
+    return [f["codigo"] for f in _fetch_todas_las_filas(query)]
 
 
 def siguiente_codigo_insumo(sb, prefijo="MAT"):
