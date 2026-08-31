@@ -44,6 +44,7 @@ Supabase (cada quien con su propio login).
 
 import re
 import unicodedata
+import uuid
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -52,6 +53,8 @@ import streamlit as st
 from supabase import create_client
 
 import base64
+
+from ocr_recibo import leer_recibo
 
 ASSETS_DIR = Path(__file__).parent / "assets"
 LOGO_PATH = ASSETS_DIR / "logo_comsas.png"
@@ -338,7 +341,7 @@ def pantalla_login():
             if auth_user_id:
                 filas_perfil = (
                     sb.table("usuarios")
-                    .select("nombre, email, rol, activo")
+                    .select("id, nombre, email, rol, activo, cargo")
                     .eq("auth_user_id", auth_user_id)
                     .limit(1)
                     .execute()
@@ -2118,6 +2121,238 @@ def importar_filas_a_presupuesto(sb, presupuesto_id, filas, codigos_encontrados)
 
 
 # ---------------------------------------------------------------------
+# Conversion de cuadro del cliente (formato libre) -> pre-presupuesto
+# ---------------------------------------------------------------------
+import unicodedata as _unicodedata
+
+_STOP_MATCH = {
+    "DE", "LA", "EL", "LOS", "LAS", "EN", "A", "CON", "PARA", "Y", "O", "SU",
+    "SUS", "UN", "UNA", "INCLUYE", "INCLUYENDO", "TODO", "NECESARIO",
+    "NECESARIA", "NECESARIAS", "CULMINAR", "ACTIVIDAD", "RETIRO",
+    "DISPOSICION", "FINAL", "EQUIPO", "HERRAMIENTA", "LO", "SE", "QUE",
+}
+
+
+def _normalizar_texto_match(s):
+    s = str(s or "")
+    s = _unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.upper()
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _tokens_match(s):
+    return {
+        w for w in _normalizar_texto_match(s).split()
+        if w not in _STOP_MATCH and len(w) > 2
+    }
+
+
+UMBRAL_MATCH_ALTO = 0.60
+
+
+def emparejar_actividad_catalogo(descripcion, unidad, catalogo_tokenizado, top=3):
+    """Compara una descripcion libre (del cuadro del cliente) contra el
+    catalogo (lista de dicts con codigo/descripcion/unidad/total/tok) y
+    devuelve los mejores candidatos [(score, item), ...] ordenados desc.
+    Mismo criterio (Jaccard + cobertura, con bono si coincide la unidad)
+    que se valido a mano contra un cuadro real antes de instalarlo aqui."""
+    t = _tokens_match(descripcion)
+    if not t:
+        return []
+    un_norm = _normalizar_texto_match(unidad)[:2] if unidad else ""
+    resultados = []
+    for item in catalogo_tokenizado:
+        it_tok = item["tok"]
+        if not it_tok:
+            continue
+        inter = len(t & it_tok)
+        if inter == 0:
+            continue
+        union = len(t | it_tok)
+        jaccard = inter / union if union else 0.0
+        cobertura = inter / min(len(t), len(it_tok))
+        score = 0.5 * jaccard + 0.5 * cobertura
+        if un_norm and _normalizar_texto_match(item.get("unidad", ""))[:2] == un_norm:
+            score += 0.08
+        resultados.append((score, item))
+    resultados.sort(key=lambda x: -x[0])
+    return resultados[:top]
+
+
+def cargar_catalogo_para_matching(sb):
+    """Trae el catalogo completo (codigo/descripcion/unidad/total) una sola
+    vez y lo deja pre-tokenizado para comparar muchas actividades sin
+    volver a golpear la base por cada una."""
+    filas = _fetch_todas_las_filas(
+        sb.table("catalogo_apu").select("codigo, descripcion, unidad, total, es_candidato")
+    )
+    catalogo = []
+    for f in filas:
+        catalogo.append(
+            {
+                "codigo": f["codigo"],
+                "descripcion": f["descripcion"],
+                "unidad": f["unidad"],
+                "total": f.get("total") or 0,
+                "tok": _tokens_match(f["descripcion"]),
+            }
+        )
+    return catalogo
+
+
+def detectar_columnas_cuadro_cliente(ws):
+    """Busca, en las primeras filas de una hoja con formato libre, cual
+    columna trae la descripcion/actividad, cual la unidad y cual la
+    cantidad (los nombres de encabezado varian de cliente a cliente).
+    Devuelve (fila_header, col_desc, col_unidad, col_cantidad) o None si
+    no logra identificar encabezados razonables."""
+    CANDIDATOS_DESC = ("DESCRIP", "ACTIVIDAD", "ITEM", "OBRA", "CONCEPTO")
+    CANDIDATOS_UNIDAD = ("UND", "UNIDAD", "UM", "UN.", "UN ")
+    CANDIDATOS_CANT = ("CANT", "CANTIDAD")
+
+    mejor = None
+    max_col = min(ws.max_column, 25)
+    max_fila = min(ws.max_row, 20)
+    for r in range(1, max_fila + 1):
+        col_desc = col_unidad = col_cant = None
+        for c in range(1, max_col + 1):
+            val = _normalizar_texto_match(ws.cell(row=r, column=c).value)
+            if not val:
+                continue
+            if col_desc is None and any(k in val for k in CANDIDATOS_DESC):
+                col_desc = c
+            elif col_unidad is None and any(val.startswith(k) for k in CANDIDATOS_UNIDAD):
+                col_unidad = c
+            elif col_cant is None and any(k in val for k in CANDIDATOS_CANT):
+                col_cant = c
+        encontrados = sum(x is not None for x in (col_desc, col_unidad, col_cant))
+        if encontrados >= 2 and (mejor is None or encontrados > mejor[4]):
+            mejor = (r, col_desc, col_unidad, col_cant, encontrados)
+    if mejor is None:
+        return None
+    r, col_desc, col_unidad, col_cant, _ = mejor
+    return r, col_desc, col_unidad, col_cant
+
+
+def parsear_cuadro_cliente_flexible(wb, hoja=None, col_desc=None, col_unidad=None, col_cantidad=None, fila_header=None):
+    """Lee un cuadro de cantidades en CUALQUIER formato (columnas y nombres
+    del cliente, sin codigos APU). Si no se pasan columnas explicitas,
+    intenta detectarlas solo. Una fila con descripcion pero sin unidad ni
+    cantidad se toma como titulo de capitulo (igual que en el Excel
+    estandar), asi el cuadro del cliente venga agrupado por actividades."""
+    ws = wb[hoja] if hoja and hoja in wb.sheetnames else wb.worksheets[0]
+
+    if col_desc is None or col_unidad is None or col_cantidad is None:
+        det = detectar_columnas_cuadro_cliente(ws)
+        if det is None:
+            return [], None
+        fila_header, col_desc, col_unidad, col_cantidad = det
+    if fila_header is None:
+        fila_header = 1
+
+    filas = []
+    capitulo_actual = "SIN CAPITULO"
+    for r in range(fila_header + 1, ws.max_row + 1):
+        desc_val = ws.cell(row=r, column=col_desc).value if col_desc else None
+        un_val = ws.cell(row=r, column=col_unidad).value if col_unidad else None
+        cant_val = ws.cell(row=r, column=col_cantidad).value if col_cantidad else None
+
+        desc = str(desc_val).strip() if desc_val is not None else ""
+        un = str(un_val).strip() if un_val is not None else ""
+        cant = float(cant_val) if isinstance(cant_val, (int, float)) else None
+
+        if not desc:
+            continue
+        if any(p in desc.upper() for p in ("SUBTOTAL", "TOTAL", "ADMINISTRACION", "IMPREVISTOS", "UTILIDAD", "GRAN TOTAL")):
+            continue
+        if not un and cant is None:
+            capitulo_actual = desc
+            continue
+
+        filas.append(
+            {
+                "capitulo": capitulo_actual,
+                "descripcion": desc,
+                "unidad": un,
+                "cantidad": cant if cant is not None else 0.0,
+            }
+        )
+    return filas, (fila_header, col_desc, col_unidad, col_cantidad)
+
+
+def convertir_cuadro_cliente_a_pre_presupuesto(sb, presupuesto_id, filas_cliente, catalogo_tokenizado):
+    """Para cada fila del cuadro del cliente busca el mejor candidato en el
+    catalogo. Si el score supera UMBRAL_MATCH_ALTO se enlaza a ese codigo
+    (con su precio actual). Si no, se crea igual como item NUEVO a precio
+    $0 (para cotizar despues) guardando la sugerencia mas parecida como
+    referencia -- asi no se detiene el pre-presupuesto por items que el
+    catalogo todavia no tiene. Devuelve la lista de resultados (para
+    mostrar la vista previa) sin insertar nada todavia."""
+    resultados = []
+    for f in filas_cliente:
+        candidatos = emparejar_actividad_catalogo(f["descripcion"], f["unidad"], catalogo_tokenizado)
+        mejor_score, mejor_item = candidatos[0] if candidatos else (0.0, None)
+        usar_match = mejor_item is not None and mejor_score >= UMBRAL_MATCH_ALTO
+        resultados.append(
+            {
+                "capitulo": f["capitulo"],
+                "descripcion": f["descripcion"],
+                "unidad": f["unidad"] or (mejor_item["unidad"] if usar_match else ""),
+                "cantidad": f["cantidad"],
+                "codigo": mejor_item["codigo"] if usar_match else None,
+                "precio_unitario": mejor_item["total"] if usar_match else 0.0,
+                "match_score": round(mejor_score, 2),
+                "sugerencia": mejor_item["descripcion"] if mejor_item else "",
+                "sugerencia_codigo": mejor_item["codigo"] if mejor_item else "",
+                "estado": "Enlazado a catalogo" if usar_match else "Nuevo (a $0, pendiente cotizar)",
+            }
+        )
+    return resultados
+
+
+def importar_resultados_conversion(sb, presupuesto_id, resultados):
+    """Inserta en el presupuesto los items ya revisados por
+    convertir_cuadro_cliente_a_pre_presupuesto (o editados a mano en la
+    vista previa). Reutiliza capitulos existentes por nombre, igual que
+    importar_filas_a_presupuesto."""
+    capitulos_existentes = (
+        sb.table("presupuesto_capitulos")
+        .select("id, nombre")
+        .eq("presupuesto_id", presupuesto_id)
+        .execute()
+        .data
+    )
+    capitulos_cache = {c["nombre"].upper(): c["id"] for c in capitulos_existentes}
+
+    insertados = 0
+    for r in resultados:
+        clave_cap = r["capitulo"].upper()
+        if clave_cap not in capitulos_cache:
+            nuevo_cap = (
+                sb.table("presupuesto_capitulos")
+                .insert({"presupuesto_id": presupuesto_id, "codigo": None, "nombre": r["capitulo"]})
+                .execute()
+            )
+            capitulos_cache[clave_cap] = nuevo_cap.data[0]["id"]
+
+        sb.table("presupuesto_items").insert(
+            {
+                "presupuesto_id": presupuesto_id,
+                "capitulo_id": capitulos_cache[clave_cap],
+                "apu_codigo": r["codigo"],
+                "descripcion_snapshot": r["descripcion"],
+                "unidad_snapshot": r["unidad"],
+                "cantidad": r["cantidad"],
+                "precio_unitario_snapshot": r["precio_unitario"],
+            }
+        ).execute()
+        insertados += 1
+    return insertados
+
+
+# ---------------------------------------------------------------------
 # Fase 4: mantenimiento de precios
 # ---------------------------------------------------------------------
 def calcular_vigencia(fecha_cotizacion, origen_precio):
@@ -2262,7 +2497,7 @@ def buscar_variacion_icoced_dane():
     https://www.dane.gov.co/.../anex-ICOCED-<mes><anio>.xlsx) y ubicar la
     variacion mensual del grupo de costo 'Materiales'.
 
-    IMPORTANTE: el DANE publica esto en un Excel cuyo diseño puede
+    IMPORTANTE: el DANE publica esto en un Excel cuyo diseno puede
     cambiar de un mes a otro y no hay forma de probar este parseo contra
     el archivo real desde donde se escribio este codigo (sin acceso a
     internet en ese momento) -- por eso esto es una SUGERENCIA para que
@@ -2322,10 +2557,6 @@ def buscar_variacion_icoced_dane():
                 for otra in fila:
                     v = otra.value
                     if isinstance(v, (int, float)) and otra.column != celda_texto.column and -15 <= float(v) <= 15:
-                        # busca el encabezado de esa columna mirando hacia
-                        # arriba (hasta 20 filas) -- suele ser algo como
-                        # "Mensual" / "Año corrido" / "Doce meses", a veces
-                        # en dos niveles (grupo + periodo)
                         encabezados = []
                         for r_arriba in range(celda_texto.row - 1, max(0, celda_texto.row - 20), -1):
                             val_arriba = ws.cell(row=r_arriba, column=otra.column).value
@@ -2413,19 +2644,6 @@ def preparar_propuestas_facturas(sb, gastos):
     )
     insumos_por_codigo = {i["codigo"]: i for i in insumos_actuales}
 
-    ya_aplicados = (
-        sb.table("bitacora_precios")
-        .select("valor_nuevo")
-        .eq("origen", "FACTURA")
-        .not_.is_("insumo_codigo", "null")
-        .execute()
-        .data
-    )
-    # nota: la bitacora no guarda el id_gasto (no hay columna 'ref' en el
-    # esquema base) -- para no reaplicar el mismo gasto dos veces en la
-    # misma sesion, el filtrado real ocurre por insumo+fecha (ver abajo);
-    # esto es best-effort, igual que antes de tener un ID persistido.
-
     propuestas = []
     for g in gastos:
         insumo = insumos_por_codigo.get(g["codigo"])
@@ -2502,22 +2720,12 @@ def obtener_cargos_personal(sb):
 
 
 def crear_cargo_personal(sb, cargo, tarifa_dia, tipo):
-    """Crea un cargo/rol nuevo en cargos_personal (ej. un oficio que no
-    estaba entre los 16 originales). Queda disponible de inmediato para
-    agregarlo a la composicion de cualquier cuadrilla."""
     sb.table("cargos_personal").insert(
         {"cargo": cargo, "tarifa_dia": float(tarifa_dia), "tipo": tipo}
     ).execute()
 
 
 def calcular_costo_dia_cuadrillas(sb):
-    """Costo/dia de cada cuadrilla = suma(cantidad de cada cargo * tarifa_dia
-    del cargo) -- la misma formula viva que describe schema.sql para
-    cuadrillas.costo_dia (calculada aqui porque no es una columna fisica).
-    El costo del MAESTRO se divide entre frentes_maestro de la cuadrilla
-    (1 = ejecuta, esta todo el dia en esa cuadrilla; 4, por ejemplo, =
-    dirige y rota entre varios frentes) -- igual que la formula de la
-    hoja CUADRILLAS del Excel maestro (CREAR_CUADRILLAS.txt)."""
     cargos = {c["cargo"]: float(c["tarifa_dia"]) for c in obtener_cargos_personal(sb)}
     frentes = {
         c["codigo"]: max(int(c.get("frentes_maestro") or 1), 1)
@@ -2537,8 +2745,6 @@ def calcular_costo_dia_cuadrillas(sb):
 
 
 def obtener_cuadrillas(sb):
-    """Lista todas las cuadrillas (activas e inactivas) con su costo/dia
-    calculado en vivo -- base del CRUD de Fase 2."""
     filas = (
         sb.table("cuadrillas")
         .select("codigo, nombre, frentes_maestro, uso_sugerido, activo")
@@ -2553,8 +2759,6 @@ def obtener_cuadrillas(sb):
 
 
 def obtener_composicion_cuadrilla(sb, codigo):
-    """Cargos y cantidades de una cuadrilla, con tarifa y subtotal (el
-    del MAESTRO ya dividido por frentes_maestro) para el editor."""
     cuadrilla = sb.table("cuadrillas").select("frentes_maestro").eq("codigo", codigo).execute().data
     frentes = max(int((cuadrilla[0]["frentes_maestro"] if cuadrilla else 1) or 1), 1)
     filas = (
@@ -2600,8 +2804,6 @@ def actualizar_cuadrilla(sb, codigo, nombre, frentes_maestro, uso_sugerido, acti
 
 
 def guardar_composicion_cuadrilla(sb, codigo, df_cargos):
-    """Sincroniza cuadrilla_cargos con lo editado en pantalla: borra los
-    marcados como eliminar, agrega/actualiza cantidad de los demas."""
     import pandas as pd
 
     for _, fila in df_cargos.iterrows():
@@ -2619,11 +2821,6 @@ def guardar_composicion_cuadrilla(sb, codigo, df_cargos):
 
 
 def asignar_cuadrilla_apu(sb, apu_codigo, apu_original, cuadrilla_codigo):
-    """Asigna, cambia o quita la cuadrilla de un APU. Si queda con
-    cuadrilla y el APU ya tiene rendimiento_dia, recalcula
-    mano_obra = costo_dia_cuadrilla / rendimiento_dia (igual que el
-    recosteo de Fase 4) y lo deja en la bitacora -- equivalente a
-    ASIGNAR_CUADRILLAS.txt / CAMBIAR_CUADRILLA.txt del Excel maestro."""
     cambios = {"cuadrilla_codigo": cuadrilla_codigo or None}
     rendimiento = float(apu_original.get("rendimiento_dia") or 0)
     mano_obra_anterior = float(apu_original.get("mano_obra") or 0)
@@ -2648,10 +2845,6 @@ def obtener_apus_con_cuadrilla(sb):
 
 
 def calcular_impacto_recosteo(sb):
-    """Recalcula mano_obra = costo_dia_cuadrilla / rendimiento_dia para
-    cada APU que ya tenga cuadrilla_codigo y rendimiento_dia asignados
-    -- equivalente a RECOSTEAR_MO, pero solo para lo que la Fase 2 ya
-    permite enlazar (los demas APUs quedan igual, se corrigen a mano)."""
     costo_dia = calcular_costo_dia_cuadrillas(sb)
     filas = obtener_apus_con_cuadrilla(sb)
     impacto = []
@@ -2710,9 +2903,6 @@ def obtener_bitacora(sb, limite=200):
 
 
 def obtener_parametro(sb, clave, default=""):
-    """Lee un valor de la tabla parametros (parte del esquema desde la
-    Fase 0). Se usa aqui para recordar el ultimo % de ICOCED usado, para
-    no tener que escribirlo desde cero cada vez."""
     fila = sb.table("parametros").select("valor").eq("clave", clave).execute().data
     return fila[0]["valor"] if fila else default
 
@@ -2724,16 +2914,7 @@ def guardar_parametro(sb, clave, valor, descripcion=None):
     sb.table("parametros").upsert(registro).execute()
 
 
-# ---------------------------------------------------------------------
-# Editor de receta de APU (que insumos usa, cantidades, rendimiento,
-# equipo/transporte). Esto era la parte de "gestion de la biblioteca
-# maestra de APUs" que el plan original dejaba en el Excel -- ahora que
-# la Fase 4 ya trajo el desglose por insumo, se puede editar aqui.
-# ---------------------------------------------------------------------
 def obtener_categorias_apu(sb):
-    """Lista de categorias (prefijo del codigo, ej. 'PRE', 'CIM', 'PIS')
-    para poder filtrar antes de buscar -- son ~2300 APUs en total, muy
-    dificil de recordar por codigo, mas facil por capitulo."""
     filas = sb.table("catalogo_apu").select("categoria").eq("es_candidato", False).limit(5000).execute().data
     return sorted({f["categoria"] for f in filas if f.get("categoria")})
 
@@ -2799,8 +2980,6 @@ def obtener_fijos_de_apu(sb, codigo):
 
 
 def obtener_equipo_de_apu(sb, codigo):
-    """Lineas de equipo/herramienta del APU (seccion 'I. EQUIPO Y
-    HERRAMIENTAS' del Excel) -- mismo patron que obtener_fijos_de_apu."""
     filas = (
         sb.table("apu_equipo_items")
         .select("id, descripcion, unidad, cantidad, precio_unitario")
@@ -2816,8 +2995,6 @@ def obtener_equipo_de_apu(sb, codigo):
 
 
 def obtener_transporte_de_apu(sb, codigo):
-    """Lineas de transporte del APU (seccion 'III. TRANSPORTES' del
-    Excel) -- mismo patron que obtener_fijos_de_apu."""
     filas = (
         sb.table("apu_transporte_items")
         .select("id, descripcion, unidad, cantidad, precio_unitario")
@@ -2848,10 +3025,6 @@ def buscar_insumos_catalogo(sb, texto, limite=20):
 
 
 def _siguiente_numero_codigo(codigos_existentes, prefijo):
-    """Dado un listado de codigos 'PREFIJO-0001' y un prefijo, calcula el
-    siguiente numero consecutivo y el ancho (cantidad de digitos) a usar
-    -- toma el ancho del codigo mas reciente con ese prefijo para no
-    romper el formato (ej. insumos usan 4 digitos, APUs usan 3)."""
     prefijo = prefijo.strip().upper()
     numeros = []
     ancho = 3
@@ -2871,17 +3044,6 @@ def _siguiente_numero_codigo(codigos_existentes, prefijo):
 
 
 def _fetch_todas_las_filas(query):
-    """Trae TODAS las filas de una consulta de Supabase paginando con
-    .range(), en vez de un solo .execute() -- Supabase/PostgREST limita
-    cada respuesta a 1000 filas por defecto, y con mas de 1000 filas para
-    una misma tabla/prefijo (ej. mas de 1000 insumos 'MAT-') un solo
-    .execute() se queda corto silenciosamente: no avisa que trunco nada,
-    solo devuelve las primeras 1000 (en el orden que le de la gana al
-    motor si no se pidio order(), o por el order() pedido si lo hay).
-    Esto hacia que el consecutivo sugerido pisara codigos que ya existian
-    mas alla de esa fila 1000, y que listados como el Semaforo de
-    vigencia mostraran solo una porcion del catalogo real. Paginando de a
-    1000 nos aseguramos de ver el listado completo."""
     paso = 1000
     filas = []
     inicio = 0
@@ -2897,16 +3059,10 @@ def _fetch_todas_las_filas(query):
 
 
 def _fetch_todos_los_codigos(query):
-    """Igual que _fetch_todas_las_filas pero devuelve solo el campo
-    'codigo' de cada fila (para las funciones de siguiente-consecutivo,
-    que solo necesitan los codigos)."""
     return [f["codigo"] for f in _fetch_todas_las_filas(query)]
 
 
 def siguiente_codigo_insumo(sb, prefijo="MAT"):
-    """Siguiente codigo libre para un insumo nuevo, ej. 'MAT-2201' si el
-    ultimo insumo MAT- que existe es 'MAT-2200'. Evita que dos personas
-    inventen el mismo codigo a mano y se sobreescriban sin darse cuenta."""
     prefijo = (prefijo or "MAT").strip().upper()
     query = sb.table("insumos").select("codigo").ilike("codigo", f"{prefijo}-%")
     codigos = _fetch_todos_los_codigos(query)
@@ -2915,8 +3071,6 @@ def siguiente_codigo_insumo(sb, prefijo="MAT"):
 
 
 def siguiente_codigo_apu(sb, categoria):
-    """Siguiente codigo libre para un APU nuevo dentro de un capitulo/
-    categoria, ej. 'PIN-066' si el ultimo PIN- que existe es 'PIN-065'."""
     categoria = (categoria or "").strip().upper()
     if not categoria:
         return ""
@@ -2927,9 +3081,6 @@ def siguiente_codigo_apu(sb, categoria):
 
 
 def crear_insumo_nuevo(sb, codigo, descripcion, unidad, precio, proveedor=None, marcar_cotizado=True):
-    """Da de alta un insumo que todavia no existe en la tabla insumos --
-    antes de esto, solo se podian enlazar insumos ya cargados desde el
-    Excel maestro."""
     codigo = codigo.strip().upper()
     if sb.table("insumos").select("codigo").eq("codigo", codigo).execute().data:
         raise ValueError(f"Ya existe un insumo con el codigo {codigo}.")
@@ -2960,8 +3111,6 @@ def crear_insumo_nuevo(sb, codigo, descripcion, unidad, precio, proveedor=None, 
 
 
 def crear_apu_nuevo(sb, codigo, descripcion, unidad):
-    """Da de alta un APU nuevo (vacio, sin receta todavia) -- antes de
-    esto solo se podian editar APUs que ya existian en el catalogo."""
     codigo = codigo.strip().upper()
     if "-" not in codigo:
         raise ValueError("El codigo debe tener el formato CATEGORIA-NUMERO, ej. PIN-068.")
@@ -2984,12 +3133,6 @@ def crear_apu_nuevo(sb, codigo, descripcion, unidad):
 
 
 def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad_nueva=None):
-    """Crea un APU nuevo copiando la receta completa de uno que ya existe:
-    cuadrilla asignada, rendimiento, equipo, transporte, y todos los
-    insumos y lineas de materiales fijas. Sirve para partir de un APU
-    parecido y solo ajustarle un par de cosas (una cantidad, un insumo
-    distinto, etc.) en vez de armar todo desde cero. Deja registro en la
-    bitacora indicando de que APU se duplico."""
     codigo_origen = codigo_origen.strip().upper()
     codigo_nuevo = codigo_nuevo.strip().upper()
 
@@ -3001,7 +3144,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
     if sb.table("catalogo_apu").select("codigo").eq("codigo", codigo_nuevo).execute().data:
         raise ValueError(f"Ya existe un APU con el codigo {codigo_nuevo}.")
 
-    # --- 1. fila principal: copia los valores de costo/receta general ---
     registro = {
         "codigo": codigo_nuevo,
         "descripcion": (descripcion_nueva or apu_original["descripcion"]).strip(),
@@ -3016,7 +3158,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
     }
     sb.table("catalogo_apu").insert(registro).execute()
 
-    # --- 2. copiar insumos de la receta (apu_insumos) ---
     insumos_origen = (
         sb.table("apu_insumos")
         .select("insumo_codigo, cantidad")
@@ -3032,7 +3173,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
             ]
         ).execute()
 
-    # --- 3. copiar lineas de materiales fijas (apu_materiales_fijos) ---
     fijos_origen = (
         sb.table("apu_materiales_fijos")
         .select("descripcion, unidad, cantidad, precio_unitario")
@@ -3054,7 +3194,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
             ]
         ).execute()
 
-    # --- 3b. copiar lineas de equipo (apu_equipo_items) ---
     equipo_origen = (
         sb.table("apu_equipo_items")
         .select("descripcion, unidad, cantidad, precio_unitario")
@@ -3067,7 +3206,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
             [{"apu_codigo": codigo_nuevo, **f} for f in equipo_origen]
         ).execute()
 
-    # --- 3c. copiar lineas de transporte (apu_transporte_items) ---
     transporte_origen = (
         sb.table("apu_transporte_items")
         .select("descripcion, unidad, cantidad, precio_unitario")
@@ -3080,7 +3218,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
             [{"apu_codigo": codigo_nuevo, **f} for f in transporte_origen]
         ).execute()
 
-    # --- 4. recalcular materiales del nuevo APU desde la vista (insumos + fijos ya copiados) ---
     if insumos_origen or fijos_origen:
         calculado = (
             sb.table("v_apu_materiales_calculado")
@@ -3092,7 +3229,6 @@ def duplicar_apu(sb, codigo_origen, codigo_nuevo, descripcion_nueva=None, unidad
         materiales_nuevo = round(float(calculado[0]["materiales_calculado"]), 0) if calculado else 0.0
         sb.table("catalogo_apu").update({"materiales": materiales_nuevo}).eq("codigo", codigo_nuevo).execute()
 
-    # --- 5. bitacora: queda registrado de que APU se duplico ---
     sb.table("bitacora_precios").insert(
         {
             "apu_codigo": codigo_nuevo,
@@ -3127,13 +3263,6 @@ def _registrar_cambio_apu(sb, apu_codigo, campo, viejo, nuevo, origen="MANUAL"):
 
 
 def _sincronizar_items_por_lineas(sb, tabla, apu_codigo, df, valor_manual_respaldo):
-    """Aplica a una tabla de lineas (apu_equipo_items o
-    apu_transporte_items -- misma forma que apu_materiales_fijos) los
-    cambios editados en pantalla: borra las marcadas, actualiza cantidad/
-    precio de las demas. Devuelve el subtotal: si quedan lineas, es la
-    suma de cantidad*precio_unitario de todas; si no quedan lineas (o
-    nunca se detallo por lineas), devuelve el valor manual de respaldo
-    (para no perder el numero que ya tenia el APU antes de este cambio)."""
     for _, fila in df.iterrows():
         if fila.get("eliminar"):
             sb.table(tabla).delete().eq("id", int(fila["id"])).execute()
@@ -3152,16 +3281,6 @@ def guardar_receta_apu(
     sb, apu_codigo, apu_original, df_insumos, df_fijos, df_equipo, df_transporte,
     equipo_manual, transporte_manual, rendimiento_dia, mano_obra_manual,
 ):
-    """Aplica los cambios de la receta de un APU: sincroniza apu_insumos,
-    apu_materiales_fijos, apu_equipo_items y apu_transporte_items con lo
-    editado en pantalla, actualiza equipo/transporte/rendimiento_dia (y
-    mano_obra si no tiene cuadrilla asignada), recalcula materiales desde
-    v_apu_materiales_calculado, y deja todo registrado en la bitacora.
-    Equipo y transporte se calculan por lineas (igual que materiales) si
-    el APU ya tiene alguna linea cargada; si no tiene ninguna, se usa el
-    valor manual (compatibilidad con los APU antiguos que solo traen un
-    numero suelto de equipo/transporte, sin desglose)."""
-    # --- insumos: eliminar marcados, actualizar cantidad cambiada ---
     for _, fila in df_insumos.iterrows():
         if fila.get("eliminar"):
             sb.table("apu_insumos").delete().eq("apu_codigo", apu_codigo).eq(
@@ -3172,7 +3291,6 @@ def guardar_receta_apu(
                 "apu_codigo", apu_codigo
             ).eq("insumo_codigo", fila["insumo_codigo"]).execute()
 
-    # --- lineas fijas: eliminar marcadas, actualizar cambiadas ---
     for _, fila in df_fijos.iterrows():
         if fila.get("eliminar"):
             sb.table("apu_materiales_fijos").delete().eq("id", int(fila["id"])).execute()
@@ -3184,7 +3302,6 @@ def guardar_receta_apu(
                 }
             ).eq("id", int(fila["id"])).execute()
 
-    # --- materiales: recalcular desde la vista (insumos + fijos, ya actualizados) ---
     calculado = (
         sb.table("v_apu_materiales_calculado")
         .select("materiales_calculado")
@@ -3195,13 +3312,11 @@ def guardar_receta_apu(
     materiales_nuevo = round(float(calculado[0]["materiales_calculado"]), 0) if calculado else 0.0
     _registrar_cambio_apu(sb, apu_codigo, "materiales", apu_original.get("materiales"), materiales_nuevo)
 
-    # --- equipo y transporte: por lineas si las tiene, si no el valor manual ---
     equipo_nuevo = _sincronizar_items_por_lineas(sb, "apu_equipo_items", apu_codigo, df_equipo, equipo_manual)
     transporte_nuevo = _sincronizar_items_por_lineas(
         sb, "apu_transporte_items", apu_codigo, df_transporte, transporte_manual
     )
 
-    # --- mano de obra: si tiene cuadrilla, se recalcula sola; si no, se edita a mano ---
     cuadrilla_codigo = apu_original.get("cuadrilla_codigo")
     if cuadrilla_codigo and rendimiento_dia:
         costo_dia = calcular_costo_dia_cuadrillas(sb).get(cuadrilla_codigo)
@@ -3216,7 +3331,6 @@ def guardar_receta_apu(
         sb, apu_codigo, "rendimiento_dia", apu_original.get("rendimiento_dia"), rendimiento_dia
     )
 
-    # --- si ya quedo con algun costo real, deja de ser "candidato" (incompleto) ---
     personal_supervision = float(apu_original.get("personal_supervision") or 0)
     total_nuevo = materiales_nuevo + mano_obra_nuevo + equipo_nuevo + transporte_nuevo + personal_supervision
     actualizacion = {
@@ -3233,11 +3347,6 @@ def guardar_receta_apu(
 
 
 def calcular_plazo_dias_sugerido(sb, items):
-    """Plazo sugerido = suma de los dias de cada actividad del presupuesto
-    (cantidad / rendimiento_dia del APU), tratando todo como secuencial --
-    la opcion simple y conservadora que se definio como regla de negocio
-    el 2026-08-03. Devuelve (dias_sugeridos, [codigos sin rendimiento
-    definido que no se pudieron contar])."""
     codigos = sorted({it["apu_codigo"] for it in items if it.get("apu_codigo")})
     rendimientos = {}
     if codigos:
@@ -3262,9 +3371,6 @@ def calcular_plazo_dias_sugerido(sb, items):
     return round(total_dias, 1), sin_rendimiento
 
 
-# ---------------------------------------------------------------------
-# Estado de sesion
-# ---------------------------------------------------------------------
 if "presupuesto_id" not in st.session_state:
     st.session_state.presupuesto_id = None
 
@@ -3274,7 +3380,7 @@ st.markdown(
 )
 st.caption("Fase 1 + 2 + 3 + 4 + 5 - conectado a la base de datos real (catalogo_apu, cuadrillas, etc.)")
 
-tab_nuevo, tab_catalogo, tab_resumen, tab_aiu, tab_precios, tab_editor_apu = st.tabs(
+tab_nuevo, tab_catalogo, tab_resumen, tab_aiu, tab_precios, tab_editor_apu, tab_gastos = st.tabs(
     [
         "1. Presupuesto",
         "2. Agregar items del catalogo",
@@ -3282,17 +3388,15 @@ tab_nuevo, tab_catalogo, tab_resumen, tab_aiu, tab_precios, tab_editor_apu = st.
         "4. AIU y propuesta",
         "5. Mantenimiento de precios",
         "6. Editar receta de APU",
+        "7. Control de gastos",
     ]
 )
 
-# ---------------------------------------------------------------------
-# TAB 1: crear o elegir presupuesto
-# ---------------------------------------------------------------------
 with tab_nuevo:
     st.subheader("Crear presupuesto nuevo")
     st.caption(
         "El plazo ya NO se pregunta aqui -- se calcula solo, a partir del rendimiento "
-        "de las actividades que agregues, en la pestaña '3. Resumen y total' (y ahi "
+        "de las actividades que agregues, en la pestana '3. Resumen y total' (y ahi "
         "mismo lo puedes ajustar a mano si el que calcula la app queda corto o largo)."
     )
     with st.form("form_nuevo_presupuesto"):
@@ -3326,11 +3430,6 @@ with tab_nuevo:
 
     st.divider()
     st.subheader("O importar un presupuesto ya armado desde Excel")
-    st.caption(
-        "Trae cliente, proyecto, ubicacion y plazo directamente del Excel (hoja INICIO / "
-        "CRONOGRAMA) y los items de la hoja PRESUPUESTO, todo en un solo paso -- para no "
-        "volver a digitar datos que ya estan ahi y evitar errores de transcripcion."
-    )
     archivo_gral = st.file_uploader(
         "Archivo Excel (.xlsx o .xlsm) del presupuesto ya armado",
         type=["xlsx", "xlsm"],
@@ -3361,10 +3460,6 @@ with tab_nuevo:
     items_gral = st.session_state.get("import_items_general", [])
 
     if datos_gral is not None:
-        st.caption(
-            "Estos datos vienen del Excel -- revisalos y corrige lo que haga falta antes "
-            "de crear el presupuesto."
-        )
         colg1, colg2 = st.columns(2)
         with colg1:
             cliente_g = st.text_input(
@@ -3408,7 +3503,7 @@ with tab_nuevo:
             )
             st.dataframe(df_prev_g, width="stretch", hide_index=True)
             total_import_g = df_prev_g["Subtotal"].sum()
-            st.write(f"**{len(items_gral)} item(s) detectados · Total: {money(total_import_g)}**")
+            st.write(f"**{len(items_gral)} item(s) detectados - Total: {money(total_import_g)}**")
 
             sin_match_g = int((df_prev_g["En catalogo"] == "No").sum())
             if sin_match_g:
@@ -3452,10 +3547,6 @@ with tab_nuevo:
 
     st.divider()
     st.subheader("O continuar / editar un presupuesto existente")
-    st.caption(
-        "Incluye presupuestos ya generados: si el cliente pide agregar o quitar "
-        "actividades, lo reabres aqui en vez de rehacerlo desde cero."
-    )
     existentes = (
         sb.table("presupuestos")
         .select("id, cliente, proyecto, estado, creado_en")
@@ -3480,21 +3571,11 @@ with tab_nuevo:
     if st.session_state.presupuesto_id:
         st.info(f"Presupuesto activo (id): {st.session_state.presupuesto_id}")
 
-# ---------------------------------------------------------------------
-# TAB 2: buscar y agregar items del catalogo
-# ---------------------------------------------------------------------
 with tab_catalogo:
     if not st.session_state.presupuesto_id:
-        st.warning("Primero crea o elige un presupuesto en la pestaña 1.")
+        st.warning("Primero crea o elige un presupuesto en la pestana 1.")
     else:
         with st.expander("Importar un presupuesto ya armado desde Excel"):
-            st.caption(
-                "Sube la copia en Excel de un presupuesto existente (hoja 'PRESUPUESTO' del "
-                "MODULO_PRESUPUESTOS_COMSAS_V4, con columnas COD APU | ITEM | ACTIVIDAD | UN | "
-                "CANT | VR UNITARIO | VR TOTAL). Se usan los precios que ya estaban en el Excel "
-                "-- no se recalculan con el catalogo actual -- para que el total importado "
-                "coincida exactamente con el original."
-            )
             archivo = st.file_uploader(
                 "Archivo Excel (.xlsx o .xlsm)", type=["xlsx", "xlsm"], key="importador_excel"
             )
@@ -3541,7 +3622,7 @@ with tab_catalogo:
                 )
                 st.dataframe(df_prev, width="stretch", hide_index=True)
                 total_import = df_prev["Subtotal"].sum()
-                st.write(f"**{len(filas_import)} item(s) detectados · Total: {money(total_import)}**")
+                st.write(f"**{len(filas_import)} item(s) detectados - Total: {money(total_import)}**")
 
                 sin_match = int((df_prev["En catalogo"] == "No").sum())
                 if sin_match:
@@ -3557,7 +3638,80 @@ with tab_catalogo:
                     )
                     st.session_state.importacion_filas = []
                     st.success(
-                        f"{insertados} item(s) importado(s). Ve a la pestaña 3 para ver el total."
+                        f"{insertados} item(s) importado(s). Ve a la pestana 3 para ver el total."
+                    )
+                    st.rerun()
+
+        with st.expander("Convertir cuadro del cliente (cualquier formato) a pre-presupuesto"):
+            archivo_cliente = st.file_uploader(
+                "Cuadro del cliente (.xlsx o .xlsm)", type=["xlsx", "xlsm"], key="importador_cuadro_cliente"
+            )
+            hoja_cliente = st.text_input(
+                "Nombre de la hoja (vacio = la primera hoja del archivo)",
+                value="", key="hoja_cuadro_cliente",
+            )
+
+            if archivo_cliente is not None and st.button("Leer y comparar contra el catalogo", key="btn_leer_cuadro_cliente"):
+                try:
+                    libro_cliente = cargar_libro_excel(archivo_cliente)
+                    filas_cliente, columnas_detectadas = parsear_cuadro_cliente_flexible(
+                        libro_cliente, hoja_cliente or None
+                    )
+                    if not filas_cliente:
+                        st.warning(
+                            "No pude identificar las columnas de descripcion/unidad/cantidad "
+                            "en las primeras filas. Revisa el nombre de la hoja, o dime cuales "
+                            "son los encabezados para ajustar la deteccion."
+                        )
+                        st.session_state.conversion_resultados = []
+                    else:
+                        catalogo_match = cargar_catalogo_para_matching(sb)
+                        st.session_state.conversion_resultados = convertir_cuadro_cliente_a_pre_presupuesto(
+                            sb, st.session_state.presupuesto_id, filas_cliente, catalogo_match
+                        )
+                        st.caption(f"Columnas detectadas -> fila encabezado {columnas_detectadas[0]}")
+                except Exception as e:
+                    st.error(f"No pude leer el archivo: {e}")
+                    st.session_state.conversion_resultados = []
+
+            resultados_conv = st.session_state.get("conversion_resultados", [])
+            if resultados_conv:
+                import pandas as pd
+
+                df_conv = pd.DataFrame(
+                    [
+                        {
+                            "Capitulo": r["capitulo"],
+                            "Descripcion (cliente)": r["descripcion"],
+                            "Unidad": r["unidad"],
+                            "Cantidad": r["cantidad"],
+                            "Estado": r["estado"],
+                            "Codigo sugerido/enlazado": r["codigo"] or r["sugerencia_codigo"],
+                            "Descripcion en catalogo": r["sugerencia"],
+                            "Parecido": r["match_score"],
+                            "Precio unitario": r["precio_unitario"],
+                        }
+                        for r in resultados_conv
+                    ]
+                )
+                st.dataframe(df_conv, width="stretch", hide_index=True)
+
+                n_enlazados = sum(1 for r in resultados_conv if r["codigo"])
+                n_nuevos = len(resultados_conv) - n_enlazados
+                st.write(
+                    f"**{len(resultados_conv)} actividad(es) leidas - {n_enlazados} enlazada(s) "
+                    f"al catalogo - {n_nuevos} nueva(s) a $0 pendientes de cotizar.**"
+                )
+
+                if st.button("Importar estas actividades al presupuesto activo", type="primary", key="btn_importar_conversion"):
+                    insertados_conv = importar_resultados_conversion(
+                        sb, st.session_state.presupuesto_id, resultados_conv
+                    )
+                    st.session_state.conversion_resultados = []
+                    st.success(
+                        f"{insertados_conv} item(s) importado(s) desde el cuadro del cliente. "
+                        "Ve a la pestana 3 para ver el total y a Memoria de Cantidades si "
+                        "aplica."
                     )
                     st.rerun()
 
@@ -3579,7 +3733,7 @@ with tab_catalogo:
             query = query.eq("es_candidato", False)
         resultados = query.order("codigo").limit(100).execute().data
 
-        st.caption(f"{len(resultados)} resultados (máximo 100 mostrados)")
+        st.caption(f"{len(resultados)} resultados (maximo 100 mostrados)")
 
         cantidades = {}
         for item in resultados:
@@ -3587,7 +3741,7 @@ with tab_catalogo:
             with c1:
                 st.text(item["codigo"])
             with c2:
-                st.text(f"{item['descripcion'][:90]}  ·  {item['unidad']}")
+                st.text(f"{item['descripcion'][:90]}  -  {item['unidad']}")
             with c3:
                 st.text(money(item["total"]))
             with c4:
@@ -3601,7 +3755,6 @@ with tab_catalogo:
             for item in resultados:
                 cant = cantidades.get(item["codigo"], 0)
                 if cant and cant > 0:
-                    # capitulo = categoria (prefijo del codigo), se crea si no existe
                     cap = (
                         sb.table("presupuesto_capitulos")
                         .select("id")
@@ -3643,12 +3796,9 @@ with tab_catalogo:
             else:
                 st.warning("No marcaste ninguna cantidad mayor a 0.")
 
-# ---------------------------------------------------------------------
-# TAB 3: resumen, editar cantidades, eliminar items, y total
-# ---------------------------------------------------------------------
 with tab_resumen:
     if not st.session_state.presupuesto_id:
-        st.warning("Primero crea o elige un presupuesto en la pestaña 1.")
+        st.warning("Primero crea o elige un presupuesto en la pestana 1.")
     else:
         items = (
             sb.table("presupuesto_items")
@@ -3659,23 +3809,18 @@ with tab_resumen:
             .data
         )
         if not items:
-            st.info("Este presupuesto todavia no tiene items. Agrega algunos en la pestaña 2.")
+            st.info("Este presupuesto todavia no tiene items. Agrega algunos en la pestana 2.")
         else:
             import pandas as pd
 
             st.subheader("Editar items (agrupado por capitulo, igual que en el Excel)")
-            st.caption(
-                "Cambia la cantidad directamente en la tabla, o marca 'Eliminar' "
-                "para quitar una actividad que el cliente ya no pidio. Al final, "
-                "dale clic a 'Guardar cambios'."
-            )
 
             por_capitulo = {}
             for it in items:
                 nombre_cap = (it.get("presupuesto_capitulos") or {}).get("nombre", "Sin capitulo")
                 por_capitulo.setdefault(nombre_cap, []).append(it)
 
-            ediciones = []  # [(items_originales_del_capitulo, dataframe_editado), ...]
+            ediciones = []
             for nombre_cap, items_cap in por_capitulo.items():
                 subtotal_cap = sum(it["cantidad"] * it["precio_unitario_snapshot"] for it in items_cap)
                 st.markdown(f"**{nombre_cap}**")
@@ -3697,7 +3842,7 @@ with tab_resumen:
                 editado_cap = st.data_editor(
                     df_cap,
                     column_config={
-                        "id": None,  # oculto, solo para identificar la fila al guardar
+                        "id": None,
                         "Precio unitario": st.column_config.NumberColumn(format="$ %d", disabled=True),
                         "Cantidad": st.column_config.NumberColumn(min_value=0.0, step=1.0),
                         "Codigo": st.column_config.TextColumn(disabled=True),
@@ -3737,10 +3882,6 @@ with tab_resumen:
                 total_general += subtotal
 
             st.markdown(f"## Costo directo total: {money(total_general)}")
-            st.caption(
-                "Este total es el costo directo, equivalente a la hoja PRESUPUESTO de tu Excel. "
-                "El AIU y la propuesta se calculan en la pestaña 4."
-            )
 
             sb.table("presupuestos").update(
                 {"costo_directo": total_general}
@@ -3750,10 +3891,7 @@ with tab_resumen:
             st.subheader("Plazo de ejecucion")
             plazo_sugerido, codigos_sin_rendimiento = calcular_plazo_dias_sugerido(sb, items)
             st.caption(
-                f"Plazo sugerido segun rendimientos: **{plazo_sugerido:g} dias** "
-                "(suma de cantidad / rendimiento-dia de cada actividad, una tras otra). "
-                "Es un punto de partida -- ajustalo abajo si tu criterio dice que la app "
-                "se quedo corta o se paso."
+                f"Plazo sugerido segun rendimientos: **{plazo_sugerido:g} dias**"
             )
             if codigos_sin_rendimiento:
                 st.caption(
@@ -3787,11 +3925,6 @@ with tab_resumen:
 
             st.divider()
             st.subheader("Refrescar precios de este presupuesto")
-            st.caption(
-                "Trae el precio actual del catalogo para los items que ya tienen apu_codigo "
-                "(los importados o agregados a mano sin codigo no se tocan). Esto SOLO afecta "
-                "este presupuesto -- ningun otro presupuesto ni el catalogo maestro se modifican."
-            )
             estado_presu = (
                 sb.table("presupuestos").select("estado").eq("id", st.session_state.presupuesto_id).single().execute().data
             )
@@ -3800,7 +3933,7 @@ with tab_resumen:
                     "Este presupuesto ya fue marcado como enviado/aprobado -- si refrescas "
                     "precios aqui, el valor interno cambia pero el documento que ya le "
                     "entregaste al cliente NO se actualiza solo. Genera la propuesta de "
-                    "nuevo en la pestaña 4 si necesitas que coincidan."
+                    "nuevo en la pestana 4 si necesitas que coincidan."
                 )
 
             if st.button("Ver cambios de precio disponibles"):
@@ -3829,7 +3962,7 @@ with tab_resumen:
                     st.dataframe(df_refresco, width="stretch", hide_index=True)
                     variacion_total = df_refresco["Var. subtotal"].sum()
                     st.write(
-                        f"**{len(cambios_refresco)} item(s) cambiarian · Variacion en el costo directo: {money(variacion_total)}**"
+                        f"**{len(cambios_refresco)} item(s) cambiarian - Variacion en el costo directo: {money(variacion_total)}**"
                     )
 
                     if st.button("Aplicar refresco de precios a este presupuesto", type="primary"):
@@ -3840,12 +3973,9 @@ with tab_resumen:
                         )
                         st.rerun()
 
-# ---------------------------------------------------------------------
-# TAB 4: AIU, propuesta en Word y Excel de respaldo
-# ---------------------------------------------------------------------
 with tab_aiu:
     if not st.session_state.presupuesto_id:
-        st.warning("Primero crea o elige un presupuesto en la pestaña 1.")
+        st.warning("Primero crea o elige un presupuesto en la pestana 1.")
     else:
         presupuesto = (
             sb.table("presupuestos")
@@ -3858,7 +3988,7 @@ with tab_aiu:
         items, por_capitulo = obtener_items_y_capitulos(sb, st.session_state.presupuesto_id)
 
         if not items:
-            st.info("Este presupuesto todavia no tiene items. Agrega algunos en la pestaña 2.")
+            st.info("Este presupuesto todavia no tiene items. Agrega algunos en la pestana 2.")
         else:
             costo_real = presupuesto.get("costo_directo") or sum(
                 float(it["cantidad"]) * float(it["precio_unitario_snapshot"]) for it in items
@@ -3891,13 +4021,6 @@ with tab_aiu:
             st.divider()
 
             st.subheader("1. Margen real de la empresa")
-            st.caption(
-                "Este margen es aparte del AIU -- NO se le muestra al cliente como tal. Se "
-                "suma al costo de cada APU (de COSTOS) ANTES de calcular el AIU, y ese costo "
-                "aumentado es el que la app usa como 'Costo directo' para todo lo demas "
-                "(AIU, propuesta, Excel de respaldo). Por defecto es el mismo para todos los "
-                "proyectos (parametro global), pero se puede ajustar solo para este proyecto."
-            )
             margen_real_pct_default = obtener_margen_real_pct(sb, presupuesto)
             margen_real_pct_ui = st.number_input(
                 "% Margen real de la empresa", min_value=0.0, max_value=100.0, step=1.0,
@@ -3920,13 +4043,8 @@ with tab_aiu:
             st.divider()
 
             st.subheader("2. Administracion, Imprevistos, Utilidad (AIU)")
-            st.caption(
-                "Se calcula sobre el costo directo YA con el margen real incluido, igual que "
-                "en PLANTILLA_AIU.xlsx. Los porcentajes quedan guardados en el presupuesto."
-            )
             st.write(f"**Costo directo:** {money(costo_directo)}")
 
-            st.caption("Los porcentajes se digitan como numero entero (12 = 12%, no 0.12).")
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 administracion_pct_ui = st.number_input(
@@ -4053,10 +4171,6 @@ with tab_aiu:
 
             carpeta_plantillas = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             plantilla_path = os.path.join(carpeta_plantillas, "PLANTILLA PROPUESTA COMSAS.docx")
-            # Archivo "portador" de la macro Nlet, SOLO con esa macro (sin
-            # ninguna hoja del modulo maestro) -- para que el respaldo no
-            # cargue datos internos si algun dia se comparte por error.
-            # Se crea una unica vez en Excel (ver instrucciones aparte).
             plantilla_macro_path = os.path.join(carpeta_plantillas, "PLANTILLA_MACRO_LETRAS.xlsm")
 
             if "carpeta_guardado" not in st.session_state:
@@ -4103,9 +4217,6 @@ with tab_aiu:
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         )
 
-                        # Generar la propuesta es lo que marca que el presupuesto
-                        # dejo de ser un borrador interno. Solo avanza el estado,
-                        # nunca lo regresa (si ya estaba enviado/aprobado, se deja igual).
                         if (presupuesto.get("estado") or "borrador") == "borrador":
                             sb.table("presupuestos").update({"estado": "generado"}).eq(
                                 "id", st.session_state.presupuesto_id
@@ -4166,11 +4277,6 @@ with tab_aiu:
                     )
 
             st.divider()
-            st.caption(
-                "Excel de manejo interno (Cronograma, Lista de materiales, Flujo de caja, "
-                "Dashboard y APUs) -- solo para el equipo, NO se le manda al cliente. El "
-                "cronograma y el flujo de caja ya son diarios (no por mes/semana)."
-            )
             usar_curva_s_ui = st.checkbox(
                 "Repartir el cronograma con curva S (en vez de reparto lineal por dia)",
                 value=False,
@@ -4206,15 +4312,7 @@ with tab_aiu:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-# ---------------------------------------------------------------------
-# TAB 5: mantenimiento de precios del catalogo (Fase 4)
-# ---------------------------------------------------------------------
 with tab_precios:
-    st.caption(
-        "Mantenimiento del catalogo completo (no de un presupuesto en particular). "
-        "Equivalente a MANTENIMIENTO_PRECIOS.txt y RECOSTEAR_MANO_OBRA.txt del Excel maestro."
-    )
-
     sub_semaforo, sub_icoced, sub_facturas, sub_cuadrillas, sub_mo, sub_bitacora = st.tabs(
         [
             "Semaforo de vigencia",
@@ -4226,15 +4324,8 @@ with tab_precios:
         ]
     )
 
-    # --- Semaforo de vigencia (a nivel de insumo, hoja MATERIALES) ---
     with sub_semaforo:
         st.subheader("Semaforo de vigencia de precios de insumos")
-        st.caption(
-            "VIGENTE (<=90 dias) / POR VENCER (91-180) / VENCIDO (>180) / "
-            "ESTIMADO (ultimo cambio fue por ICOCED) / SIN FECHA (nunca se ha cotizado). "
-            "Vive a nivel de insumo (materia prima), no de APU -- un APU puede tener "
-            "varios insumos con vigencia distinta."
-        )
         import pandas as pd
 
         filas_sem = obtener_insumos_para_semaforo(sb)
@@ -4270,36 +4361,14 @@ with tab_precios:
                 hide_index=True,
             )
 
-    # --- Escalar por ICOCED (a nivel de insumo) ---
     with sub_icoced:
         st.subheader("Escalar precios de insumos por indice ICOCED (DANE)")
-        st.caption(
-            "Sube el % del subindice de MATERIALES del boletin ICOCED del mes (lo publica el "
-            "DANE, normalmente a mediados del mes siguiente). Solo se aplica a los insumos "
-            "que NO se refrescaron ya este mes (no hay doble conteo). Jerarquia: un precio "
-            "real (COTIZADO/FACTURA) manda; ICOCED solo estima mientras llega un precio real. "
-            "Al aplicar, se recalcula automaticamente el 'materiales' de cada APU que use "
-            "alguno de estos insumos."
-        )
-        st.caption(
-            "El campo ya viene con el ultimo % que usaste (guardado como parametro) -- si no "
-            "ha salido un boletin nuevo del DANE, puedes dejarlo igual; si ya sabes el nuevo "
-            "numero, solo cambialo aqui."
-        )
         pct_guardado = obtener_parametro(sb, "icoced_pct_mensual", "0")
         pct_icoced = st.number_input(
             "Variacion del mes (%)", step=0.1, format="%.2f", value=float(pct_guardado), key="pct_icoced"
         )
 
         with st.expander("Buscar el % en el boletin del DANE (beta)"):
-            st.caption(
-                "Intenta descargar el anexo mensual del ICOCED directo del DANE y encontrar "
-                "la variacion de 'Materiales'. Es un formato que el DANE puede cambiar sin "
-                "aviso, asi que esto es SOLO una sugerencia -- revisala contra el boletin "
-                "antes de usarla. Si no encuentra nada, bajalo tu mismo aqui: "
-                "https://www.dane.gov.co/index.php/estadisticas-por-tema/precios-y-costos/"
-                "indice-de-costos-de-la-construccion-de-edificaciones-icoced"
-            )
             if st.button("Buscar en el DANE"):
                 with st.spinner("Descargando y leyendo el anexo del DANE..."):
                     resultado_dane = buscar_variacion_icoced_dane()
@@ -4316,16 +4385,11 @@ with tab_precios:
                 import pandas as pd
 
                 st.caption(f"Anexo leido: {resultado_dane['mes']}{resultado_dane['anio']} -- {resultado_dane['url']}")
-                st.caption(
-                    "Busca la columna 'Mensual' (no 'Año corrido' ni 'Doce meses') en la fila "
-                    "de 'Materiales' -- si el encabezado detectado no dice claramente cual es "
-                    "cual, abre el anexo (link arriba) y usa la celda como referencia."
-                )
                 df_dane = pd.DataFrame(resultado_dane["candidatos"])
                 st.dataframe(df_dane, width="stretch", hide_index=True)
 
                 opciones = {
-                    f"{c['hoja']} · {c['celda']} · {c['encabezado']} · {c['etiqueta_fila']} = {c['valor']:g}%": c["valor"]
+                    f"{c['hoja']} - {c['celda']} - {c['encabezado']} - {c['etiqueta_fila']} = {c['valor']:g}%": c["valor"]
                     for c in resultado_dane["candidatos"]
                 }
                 etiqueta_elegida = st.selectbox(
@@ -4393,16 +4457,8 @@ with tab_precios:
         else:
             st.caption("Dale clic a 'Ver candidatos a escalar' para empezar.")
 
-    # --- Precios desde facturas (puente Control de Costos -> insumos) ---
     with sub_facturas:
         st.subheader("Actualizar precios de insumos desde el Control de Costos")
-        st.caption(
-            "Sube el Control de Costos del proyecto (hoja 'GASTOS', con COD INSUMO + CANT + "
-            "BASE + FECHA + PROVEEDOR). El precio real (BASE/CANT) manda sobre COTIZADO e "
-            "ICOCED -- este es el puente equivalente a ActualizarPreciosDesdeFacturas de la "
-            "macro. Al aplicar, se recalcula automaticamente el 'materiales' de cada APU "
-            "afectado."
-        )
         archivo_gastos = st.file_uploader(
             "Control de Costos (.xlsx o .xlsm)", type=["xlsx", "xlsm"], key="archivo_gastos"
         )
@@ -4461,17 +4517,8 @@ with tab_precios:
         else:
             st.caption("Sube el archivo y dale clic a 'Leer GASTOS y ver propuestas' para empezar.")
 
-    # --- Recosteo de mano de obra ---
-    # --- Cuadrillas: crear y editar composicion (Fase 2) ---
     with sub_cuadrillas:
         st.subheader("Cuadrillas (unidades basicas de mano de obra)")
-        st.caption(
-            "Crea cuadrillas nuevas o edita la composicion (cargo y cantidad) de las "
-            "existentes -- equivalente a CREAR_CUADRILLAS.txt del Excel maestro. El "
-            "costo/dia sale solo de las tarifas de personal (pestaña 'Recosteo de "
-            "mano de obra'). Para asignarle una cuadrilla a un APU (nuevo o "
-            "existente), hazlo desde '6. Editar receta de APU'."
-        )
         import pandas as pd
 
         cuadrillas_actuales = obtener_cuadrillas(sb)
@@ -4490,7 +4537,7 @@ with tab_precios:
 
         st.divider()
         st.markdown("**Crear o editar una cuadrilla**")
-        opciones_cuadrilla = {f"{c['codigo']} · {c['nombre']}": c["codigo"] for c in cuadrillas_actuales}
+        opciones_cuadrilla = {f"{c['codigo']} - {c['nombre']}": c["codigo"] for c in cuadrillas_actuales}
         elegida = st.selectbox(
             "Elige una cuadrilla para editarla, o crea una nueva",
             ["(nueva cuadrilla)"] + list(opciones_cuadrilla.keys()),
@@ -4508,12 +4555,6 @@ with tab_precios:
                     "Frentes maestro", min_value=1, step=1, value=1, key="frentes_cuadrilla_nueva"
                 )
             uso_nuevo = st.text_input("Uso sugerido (opcional)", key="uso_cuadrilla_nueva")
-            st.caption(
-                "Frentes maestro: 1 si el maestro EJECUTA (esta todo el dia en esa "
-                "cuadrilla, ej. pintura, enchapes) -- el numero de frentes que rota "
-                "si solo DIRIGE varias cuadrillas a la vez (ej. 4 en obra civil, "
-                "muros, demoliciones); ahi su costo se divide entre esos frentes."
-            )
             if not es_gestor():
                 st.caption("Solo un administrador o cotizador puede crear cuadrillas.")
             if st.button("Crear cuadrilla", type="primary", disabled=not es_gestor()):
@@ -4525,7 +4566,7 @@ with tab_precios:
                 else:
                     crear_cuadrilla(sb, codigo_norm, nombre_nuevo, frentes_nuevo, uso_nuevo)
                     st.success(f"Cuadrilla {codigo_norm} creada. Ahora agrega sus cargos abajo.")
-                    st.session_state.select_cuadrilla_editor = f"{codigo_norm} · {nombre_nuevo}"
+                    st.session_state.select_cuadrilla_editor = f"{codigo_norm} - {nombre_nuevo}"
                     st.rerun()
         else:
             codigo_activo = opciones_cuadrilla[elegida]
@@ -4588,10 +4629,6 @@ with tab_precios:
                 num_rows="dynamic",
                 key=f"editor_composicion_{codigo_activo}",
             )
-            st.caption(
-                "Para agregar un cargo: agrega una fila, elige el cargo y la cantidad, "
-                "y guarda -- la tarifa/subtotal se completa sola despues de guardar."
-            )
 
             if not es_gestor():
                 st.caption("Solo un administrador o cotizador puede editar la composicion de una cuadrilla.")
@@ -4602,23 +4639,11 @@ with tab_precios:
 
     with sub_mo:
         st.subheader("Cambio de tarifas de personal y recosteo de mano de obra")
-        st.caption(
-            "Edita la tarifa/dia de los cargos que cambiaron (ej. reajuste salarial anual) "
-            "y guarda. Despues, recalcula el impacto: mano_obra de cada APU se recompone "
-            "como (costo/dia de su cuadrilla) / (rendimiento del APU), igual que "
-            "RECOSTEAR_MO en el Excel -- pero solo para los APUs que ya tienen cuadrilla "
-            "y rendimiento asignados (Fase 2)."
-        )
         import pandas as pd
 
         cargos_actuales = obtener_cargos_personal(sb)
 
         with st.expander("Crear un cargo/rol nuevo"):
-            st.caption(
-                "Para un oficio que no esta entre los cargos actuales (ej. un "
-                "ayudante electrico). Una vez creado, queda disponible para "
-                "agregarlo a la composicion de cualquier cuadrilla."
-            )
             col_c1, col_c2, col_c3 = st.columns([2, 1, 1])
             with col_c1:
                 cargo_nuevo_nombre = st.text_input("Nombre del cargo (ej. AYUDANTE ELECTRICO)", key="cargo_nuevo_nombre")
@@ -4630,11 +4655,6 @@ with tab_precios:
                 cargo_nuevo_tipo = st.selectbox(
                     "Tipo", ["operativo", "supervision"], key="cargo_nuevo_tipo"
                 )
-            st.caption(
-                "'operativo' = va en cuadrillas (mano de obra del APU). "
-                "'supervision' = SISO/Residente/Director, se carga aparte en PARAMETROS, "
-                "no en cuadrillas."
-            )
             if not es_gestor():
                 st.caption("Solo un administrador o cotizador puede crear cargos.")
             if st.button("Crear cargo", disabled=not es_gestor()):
@@ -4712,8 +4732,8 @@ with tab_precios:
                 nuevo_total = df_impacto["mano_obra_nuevo"].sum()
                 var_total = ((nuevo_total - viejo_total) / viejo_total * 100) if viejo_total else 0.0
                 st.write(
-                    f"**Total mano de obra -- viejo: {money(viejo_total)} · nuevo: {money(nuevo_total)} "
-                    f"· variacion: {var_total:.1f}%**"
+                    f"**Total mano de obra -- viejo: {money(viejo_total)} - nuevo: {money(nuevo_total)} "
+                    f"- variacion: {var_total:.1f}%**"
                 )
                 st.write(f"**{len(cambian)} APU(s) van a cambiar** de {len(df_impacto)} evaluados.")
 
@@ -4729,10 +4749,8 @@ with tab_precios:
                     )
                     st.rerun()
 
-    # --- Bitacora ---
     with sub_bitacora:
         st.subheader("Bitacora de cambios de precios")
-        st.caption("Auditoria: quien cambio que precio (usuario y origen), y cuando.")
         import pandas as pd
 
         registros = obtener_bitacora(sb)
@@ -4773,23 +4791,10 @@ with tab_precios:
                 hide_index=True,
             )
 
-# ---------------------------------------------------------------------
-# TAB 6: editor de receta de APU (insumos, cantidades, rendimiento,
-# equipo, transporte) -- lo que antes solo se podia cambiar en el Excel
-# maestro.
-# ---------------------------------------------------------------------
 with tab_editor_apu:
-    st.caption(
-        "Edita la 'receta' de un APU: que insumos usa y en que cantidad, el rendimiento "
-        "por dia, y los valores de equipo/transporte. Al guardar, 'materiales' se "
-        "recalcula solo desde los insumos (y las lineas fijas); 'mano_obra' se recalcula "
-        "solo si el APU ya tiene una cuadrilla asignada -- si no, se edita directamente."
-    )
-
     col_crear1, col_crear2, col_crear3 = st.columns(3)
     with col_crear1:
         with st.expander("Crear un insumo nuevo"):
-            st.caption("Para cuando el material que necesitas todavia no esta en el catalogo de insumos.")
             nuevo_ins_prefijo = st.text_input(
                 "Prefijo del codigo (ej. MAT)", value="MAT", key="nuevo_insumo_prefijo",
             ).strip().upper() or "MAT"
@@ -4824,10 +4829,6 @@ with tab_editor_apu:
 
     with col_crear2:
         with st.expander("Crear un APU nuevo"):
-            st.caption(
-                "Arranca vacio (queda marcado como 'candidato' hasta que le agregues "
-                "insumos y guardes la receta)."
-            )
             categorias_apu_nuevo = obtener_categorias_apu(sb)
             nueva_apu_categoria = st.selectbox(
                 "Capitulo", categorias_apu_nuevo + ["(otro capitulo nuevo)"], key="nuevo_apu_categoria",
@@ -4862,11 +4863,6 @@ with tab_editor_apu:
 
     with col_crear3:
         with st.expander("Duplicar un APU existente"):
-            st.caption(
-                "Copia la cuadrilla, rendimiento, equipo, transporte y todos los "
-                "insumos/lineas fijas de un APU que ya existe a uno nuevo -- para "
-                "partir de uno parecido y solo ajustarle un par de cosas."
-            )
             categorias_dup = obtener_categorias_apu(sb)
             col_dup_cat, col_dup_txt = st.columns(2)
             with col_dup_cat:
@@ -4883,7 +4879,7 @@ with tab_editor_apu:
                 st.info("No encontre APUs con esos filtros.")
             else:
                 opciones_dup = {
-                    f"{a['codigo']} · {a['descripcion'][:70]} ({a['unidad']})": a["codigo"]
+                    f"{a['codigo']} - {a['descripcion'][:70]} ({a['unidad']})": a["codigo"]
                     for a in resultados_dup
                 }
                 elegido_dup_etiqueta = st.selectbox(
@@ -4924,10 +4920,6 @@ with tab_editor_apu:
                             st.error(str(e))
 
     st.divider()
-    st.caption(
-        "Son ~2.300 APUs -- filtra primero por capitulo (opcional) y despues elige de la "
-        "lista desplegable, o escribe parte del codigo/descripcion para acortarla."
-    )
     col_cat, col_txt = st.columns([1, 2])
     with col_cat:
         categorias_disponibles = obtener_categorias_apu(sb)
@@ -4947,7 +4939,7 @@ with tab_editor_apu:
     else:
         st.caption(f"{len(resultados_apu)} APU(s) -- si son muchos, agrega un capitulo o texto para acortar la lista.")
         opciones_apu = {
-            f"{a['codigo']} · {a['descripcion'][:70]} ({a['unidad']})": a["codigo"] for a in resultados_apu
+            f"{a['codigo']} - {a['descripcion'][:70]} ({a['unidad']})": a["codigo"] for a in resultados_apu
         }
         elegido_apu = st.selectbox(
             "Elige el APU (puedes escribir dentro de este campo para buscar en la lista)",
@@ -4965,8 +4957,8 @@ with tab_editor_apu:
             st.warning("Ese APU ya no existe en el catalogo.")
         else:
             st.divider()
-            st.subheader(f"{apu['codigo']} · {apu['descripcion']}")
-            st.caption(f"Unidad: {apu['unidad']} · Categoria: {apu['categoria']}")
+            st.subheader(f"{apu['codigo']} - {apu['descripcion']}")
+            st.caption(f"Unidad: {apu['unidad']} - Categoria: {apu['categoria']}")
 
             with st.expander("Editar descripcion / unidad de este APU"):
                 col_nom1, col_nom2 = st.columns([2, 1])
@@ -5063,10 +5055,6 @@ with tab_editor_apu:
                 st.caption(f"Subtotal equipo = {money(subtotal_equipo_actual)}")
 
             st.markdown("### II. MATERIALES")
-            st.caption(
-                "Los insumos que componen esta actividad (equivalente a la seccion "
-                "'II. MATERIALES' del APU en Excel)."
-            )
             st.markdown("**Insumos de la receta**")
             insumos_apu = obtener_insumos_de_apu(sb, apu_codigo_activo)
             df_insumos_editor = None
@@ -5097,7 +5085,7 @@ with tab_editor_apu:
                     st.info("No encontre insumos con ese texto.")
                 elif resultados_ins:
                     opciones_ins = {
-                        f"{i['codigo']} · {i['descripcion'][:70]} ({i['unidad']}, {money(i['precio'])})": i["codigo"]
+                        f"{i['codigo']} - {i['descripcion'][:70]} ({i['unidad']}, {money(i['precio'])})": i["codigo"]
                         for i in resultados_ins
                     }
                     elegido_ins = st.selectbox("Resultados", list(opciones_ins.keys()), key="select_insumo_editor")
@@ -5244,7 +5232,7 @@ with tab_editor_apu:
             cuadrillas_lista = obtener_cuadrillas(sb)
             opciones_cuad_apu = {"(sin cuadrilla -- mano de obra manual)": None}
             opciones_cuad_apu.update(
-                {f"{c['codigo']} · {c['nombre']} ({money(c['costo_dia'])}/dia)": c["codigo"] for c in cuadrillas_lista}
+                {f"{c['codigo']} - {c['nombre']} ({money(c['costo_dia'])}/dia)": c["codigo"] for c in cuadrillas_lista}
             )
             etiquetas_cuad_apu = list(opciones_cuad_apu.keys())
             actual_codigo = apu.get("cuadrilla_codigo")
@@ -5261,12 +5249,6 @@ with tab_editor_apu:
             )
             cuadrilla_elegida_codigo = opciones_cuad_apu[cuadrilla_elegida_etiqueta]
             if cuadrilla_elegida_codigo != actual_codigo:
-                st.caption(
-                    "Cambio sin guardar todavia. Si el APU ya tiene rendimiento/dia, la "
-                    "mano de obra se recalcula sola al guardar (costo/dia de la cuadrilla "
-                    "/ rendimiento) -- igual que ASIGNAR_CUADRILLAS.txt / "
-                    "CAMBIAR_CUADRILLA.txt del Excel maestro."
-                )
                 if not es_gestor():
                     st.caption("Solo un administrador o cotizador puede reasignar la cuadrilla de un APU.")
                 if st.button(
@@ -5289,7 +5271,7 @@ with tab_editor_apu:
             )
 
             if apu.get("cuadrilla_codigo"):
-                st.caption(f"Mano de obra actual (calculada = costo/dia de la cuadrilla ÷ rendimiento): {money(apu.get('mano_obra'))}")
+                st.caption(f"Mano de obra actual (calculada = costo/dia de la cuadrilla / rendimiento): {money(apu.get('mano_obra'))}")
                 mano_obra_ui = float(apu.get("mano_obra") or 0)
             else:
                 mano_obra_ui = st.number_input(
@@ -5313,10 +5295,9 @@ with tab_editor_apu:
             materiales_preview = _subtotal_editable(df_insumos_editor, "precio") + _subtotal_editable(df_fijos_editor, "precio_unitario")
             total_preview = equipo_preview + materiales_preview + transporte_preview + mano_obra_ui + float(apu.get("personal_supervision") or 0)
             st.write(
-                f"**Vista previa -- Equipo: {money(equipo_preview)} · Materiales: {money(materiales_preview)} · "
-                f"Transporte: {money(transporte_preview)} · Total APU: {money(total_preview)}**"
+                f"**Vista previa -- Equipo: {money(equipo_preview)} - Materiales: {money(materiales_preview)} - "
+                f"Transporte: {money(transporte_preview)} - Total APU: {money(total_preview)}**"
             )
-            st.caption("El total real se recalcula al guardar (por redondeo puede variar unos pesos).")
 
             if not es_gestor():
                 st.caption("Solo un administrador o cotizador puede guardar cambios de la receta de un APU.")
@@ -5336,3 +5317,227 @@ with tab_editor_apu:
                 )
                 st.success(f"Receta de {apu_codigo_activo} actualizada y registrada en la bitacora.")
                 st.rerun()
+
+
+with tab_gastos:
+    st.subheader("Registrar un gasto")
+
+    if not st.session_state.presupuesto_id:
+        st.info(
+            "Primero elige o crea el presupuesto/obra en la pestana **1. Presupuesto** "
+            "-- los gastos se registran contra esa obra."
+        )
+    else:
+        presupuesto_activo_id = st.session_state.presupuesto_id
+
+        @st.cache_data(ttl=300)
+        def _tipos_gasto_activos():
+            filas = (
+                sb.table("tipos_gasto")
+                .select("codigo, nombre, bucket_excel, requiere_capitulo, orden")
+                .eq("activo", True)
+                .order("orden")
+                .execute()
+                .data
+            )
+            return filas or []
+
+        def _capitulos_presupuesto(pid):
+            filas = (
+                sb.table("presupuesto_capitulos")
+                .select("id, nombre, orden")
+                .eq("presupuesto_id", pid)
+                .order("orden")
+                .execute()
+                .data
+            )
+            return filas or []
+
+        tipos = _tipos_gasto_activos()
+        capitulos = _capitulos_presupuesto(presupuesto_activo_id)
+
+        if not tipos:
+            st.error(
+                "No hay tipos de gasto configurados (tabla tipos_gasto vacia). "
+                "Corre fase7_control_gastos/schema_fase7.sql en Supabase."
+            )
+        else:
+            foto_camara = st.camera_input("Foto de la factura/recibo")
+            foto_archivo = None
+            if foto_camara is None:
+                foto_archivo = st.file_uploader(
+                    "...o sube la foto desde la galeria (si la camara no esta disponible)",
+                    type=["jpg", "jpeg", "png"],
+                )
+            foto = foto_camara or foto_archivo
+
+            datos_ocr = None
+            if foto is not None:
+                foto_bytes = foto.getvalue()
+                clave_ocr = f"ocr_{hash(foto_bytes)}"
+                if clave_ocr not in st.session_state:
+                    with st.spinner("Leyendo la foto..."):
+                        st.session_state[clave_ocr] = leer_recibo(foto_bytes, foto.type or "image/jpeg") or {}
+                datos_ocr = st.session_state[clave_ocr]
+                if datos_ocr:
+                    conf = (datos_ocr.get("confianza") or "").upper()
+                    if conf == "ALTA":
+                        st.success("Foto leida -- revisa los datos antes de guardar.")
+                    elif conf:
+                        st.warning(f"Foto leida con confianza {conf.lower()} -- revisa bien los datos.")
+
+            with st.form("form_gasto", clear_on_submit=True):
+                nombres_tipo = {t["nombre"]: t for t in tipos}
+                tipo_sel_nombre = st.selectbox("Tipo de gasto", list(nombres_tipo.keys()))
+                tipo_sel = nombres_tipo[tipo_sel_nombre]
+
+                capitulo_sel = None
+                if tipo_sel["requiere_capitulo"]:
+                    if capitulos:
+                        nombres_cap = [c["nombre"] for c in capitulos]
+                        capitulo_sel = st.selectbox("Capitulo", nombres_cap)
+                    else:
+                        st.caption(
+                            "Este presupuesto todavia no tiene capitulos cargados -- "
+                            "el gasto se guarda sin capitulo asignado."
+                        )
+
+                proveedor_ui = st.text_input("Proveedor", value=(datos_ocr or {}).get("proveedor") or "")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    valor_total_ui = st.number_input(
+                        "Valor total (COP)", min_value=0.0, step=1000.0,
+                        value=float((datos_ocr or {}).get("valor_total") or 0),
+                    )
+                with col_b:
+                    valor_iva_ui = st.number_input(
+                        "Valor del IVA (0 si no aplica)", min_value=0.0, step=1000.0,
+                        value=float((datos_ocr or {}).get("valor_iva") or 0),
+                    )
+                descripcion_ui = st.text_area("Descripcion", value=(datos_ocr or {}).get("descripcion") or "")
+
+                guardar = st.form_submit_button("Guardar gasto", type="primary")
+
+                if guardar:
+                    if foto is None:
+                        st.error("Falta la foto de la factura/recibo.")
+                    elif valor_total_ui <= 0:
+                        st.error("El valor total debe ser mayor a 0.")
+                    elif valor_iva_ui > valor_total_ui:
+                        st.error("El IVA no puede ser mayor que el valor total.")
+                    else:
+                        usuario = usuario_actual()
+                        ruta_foto = f"{presupuesto_activo_id}/{uuid.uuid4()}.jpg"
+                        try:
+                            sb.storage.from_("recibos").upload(
+                                ruta_foto, foto.getvalue(), {"content-type": foto.type or "image/jpeg"}
+                            )
+                        except Exception as e:
+                            st.error(f"No se pudo subir la foto ({e}). Revisa que exista el bucket 'recibos'.")
+                            st.stop()
+
+                        sb.table("gastos").insert(
+                            {
+                                "presupuesto_id": presupuesto_activo_id,
+                                "capitulo": capitulo_sel,
+                                "tipo_gasto": tipo_sel["codigo"],
+                                "proveedor": proveedor_ui or None,
+                                "descripcion": descripcion_ui or None,
+                                "valor_total": valor_total_ui,
+                                "valor_iva": valor_iva_ui,
+                                "foto_path": ruta_foto,
+                                "origen_dato": "FOTO",
+                                "ocr_revisado": True,
+                                "usuario_id": usuario.get("id"),
+                            }
+                        ).execute()
+                        st.success("Gasto guardado.")
+                        st.rerun()
+
+        st.divider()
+        st.subheader("Ejecutado vs. presupuestado (esta obra)")
+
+        gastos_obra = (
+            sb.table("gastos")
+            .select("capitulo, tipo_gasto, valor_total, fecha, proveedor, descripcion, sincronizado_excel")
+            .eq("presupuesto_id", presupuesto_activo_id)
+            .execute()
+            .data
+        ) or []
+
+        items_obra = (
+            sb.table("presupuesto_items")
+            .select("capitulo_id, subtotal")
+            .eq("presupuesto_id", presupuesto_activo_id)
+            .execute()
+            .data
+        ) or []
+
+        if not capitulos:
+            st.caption("Sin capitulos cargados en esta obra todavia.")
+        else:
+            id_a_nombre = {c["id"]: c["nombre"] for c in capitulos}
+            presupuestado_por_cap = {}
+            for it in items_obra:
+                nom = id_a_nombre.get(it.get("capitulo_id"))
+                if nom:
+                    presupuestado_por_cap[nom] = presupuestado_por_cap.get(nom, 0) + float(it.get("subtotal") or 0)
+
+            ejecutado_por_cap = {}
+            for g in gastos_obra:
+                cap = g.get("capitulo") or "(sin capitulo)"
+                ejecutado_por_cap[cap] = ejecutado_por_cap.get(cap, 0) + float(g.get("valor_total") or 0)
+
+            filas_resumen = []
+            for nom in [c["nombre"] for c in capitulos]:
+                pres = presupuestado_por_cap.get(nom, 0)
+                ejec = ejecutado_por_cap.get(nom, 0)
+                filas_resumen.append(
+                    {
+                        "Capitulo": nom,
+                        "Presupuestado": pres,
+                        "Ejecutado": ejec,
+                        "Saldo": pres - ejec,
+                        "% ejec.": (ejec / pres * 100) if pres else 0,
+                    }
+                )
+            df_resumen = pd.DataFrame(filas_resumen)
+            st.dataframe(
+                df_resumen.style.format(
+                    {"Presupuestado": money, "Ejecutado": money, "Saldo": money, "% ejec.": "{:.0f}%"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            total_pres = df_resumen["Presupuestado"].sum()
+            total_ejec = df_resumen["Ejecutado"].sum()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Presupuestado", money(total_pres))
+            c2.metric("Ejecutado", money(total_ejec))
+            c3.metric("Saldo", money(total_pres - total_ejec))
+
+        st.divider()
+        st.subheader("Ultimos gastos registrados")
+        if gastos_obra:
+            df_lista = pd.DataFrame(gastos_obra).sort_values("fecha", ascending=False).head(30)
+            df_lista["valor_total"] = df_lista["valor_total"].map(money)
+            df_lista["sincronizado_excel"] = df_lista["sincronizado_excel"].map(
+                lambda s: "Si" if s else "Pendiente"
+            )
+            st.dataframe(
+                df_lista.rename(
+                    columns={
+                        "fecha": "Fecha",
+                        "capitulo": "Capitulo",
+                        "tipo_gasto": "Tipo",
+                        "proveedor": "Proveedor",
+                        "descripcion": "Descripcion",
+                        "valor_total": "Valor",
+                        "sincronizado_excel": "En Excel",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("Todavia no hay gastos registrados en esta obra.")
