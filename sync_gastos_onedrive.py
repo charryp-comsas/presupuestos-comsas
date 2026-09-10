@@ -6,12 +6,14 @@ COSTOS de la obra activa, guardado en OneDrive. Sentido UNICO:
 Supabase -> Excel (el Excel nunca escribe de vuelta a Supabase).
 
 Variables de entorno requeridas (Secrets en GitHub):
-  SUPABASE_URL
-  SUPABASE_SERVICE_ROLE_KEY   -- OJO: service role, NO la anon key (ver
-                                  supabase_read.py:leer_gastos_pendientes).
-                                  Se saca en Supabase > Project Settings >
-                                  API > "service_role" (secreta, nunca
-                                  compartirla ni ponerla en la App).
+  SUPABASE_DB_URL              -- connection string directo a Postgres
+                                  (Project Settings > Database > Connection
+                                  string). Se usa en vez de la service_role
+                                  key porque el gateway REST de Supabase
+                                  tuvo un bug largo (ver supabase_read.py)
+                                  que rechazaba las peticiones autenticadas
+                                  con esa key -- conectando directo a
+                                  Postgres se evita esa capa por completo.
   MS_CLIENT_ID / MS_REFRESH_TOKEN   -- los mismos que ya usa sync-precios.
   PRESUPUESTO_ID_ACTIVO       -- uuid del presupuesto/obra cuyo Excel se
                                   esta sincronizando (por ahora, UNA obra
@@ -42,8 +44,7 @@ from supabase_read import leer_gastos_pendientes, marcar_gastos_sincronizados
 
 
 def main() -> int:
-    supabase_url = os.environ["SUPABASE_URL"]
-    service_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    db_url = os.environ["SUPABASE_DB_URL"]
     client_id = os.environ["MS_CLIENT_ID"]
     refresh_token = os.environ["MS_REFRESH_TOKEN"]
     presupuesto_id_activo = os.environ["PRESUPUESTO_ID_ACTIVO"]
@@ -55,7 +56,7 @@ def main() -> int:
     nuevo_refresh = tokens.get("refresh_token", refresh_token)
 
     print("2) Leyendo gastos pendientes de sincronizar desde Supabase...")
-    todos = leer_gastos_pendientes(supabase_url, service_key)
+    todos = leer_gastos_pendientes(db_url)
     gastos = [g for g in todos if g["presupuesto_id"] == presupuesto_id_activo]
     print(f"   {len(gastos)} gastos pendientes para esta obra "
           f"({len(todos) - len(gastos)} pendientes de otra obra, se ignoran aqui).")
@@ -90,7 +91,7 @@ def main() -> int:
     print("   Listo. Archivo actualizado en OneDrive.")
 
     print("7) Marcando gastos como sincronizados en Supabase...")
-    marcar_gastos_sincronizados(supabase_url, service_key, [a.gasto_id for a in aplicados])
+    marcar_gastos_sincronizados(db_url, [a.gasto_id for a in aplicados])
     print("   Listo.")
 
     _reportar_refresh_token(nuevo_refresh)
