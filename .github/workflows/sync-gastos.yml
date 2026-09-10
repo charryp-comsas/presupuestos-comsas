@@ -15,12 +15,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install requests openpyxl
+      - run: pip install requests openpyxl psycopg2-binary
 
       - name: Ejecutar sincronizacion de gastos
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
           MS_REFRESH_TOKEN: ${{ secrets.MS_REFRESH_TOKEN }}
           PRESUPUESTO_ID_ACTIVO: ${{ secrets.PRESUPUESTO_ID_ACTIVO }}
